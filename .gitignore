@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables 
+.env
+.env.local
+.env.production
+!.env.example
+
+# Node.js (фронтенд)
+app/frontend/node_modules/
+app/frontend/dist/
+app/frontend/build/
+
+# Database
+*.db
+*.sqlite3
+postgres_data/
+
+# Docker volumes
+redis_data/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+
+# Rate limiting state
+.ratelimit
+
+# Coverage (pytest-cov)
+.coverage
+htmlcov/

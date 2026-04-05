@@ -1,0 +1,64 @@
+services:
+  db: # БАЗА ДАННЫХ
+    image: postgres:15 # Какой образ БД использовать
+    container_name: msghub_db
+    environment: # Переменные окружения
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes: # Постоянное хранилище
+      - postgres_data:/var/lib/postgresql/data
+    ports: # Проброс портов
+      - "5432:5432"
+    networks:
+      - msghub_network
+    restart: unless-stopped
+
+  redis: # Redis
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    container_name: msghub_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - msghub_network
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+  
+  backend: # Бэкенд
+    build: # Будем собирать образ из DockerFile
+      context: .
+      dockerfile: Dockerfile
+    container_name: msghub_backend
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+    networks:
+      - msghub_network
+    restart: unless-stopped
+  
+  # frontend: # Фронтенд
+  #   build: 
+  #     context: ./app/frontend
+  #     dockerfile: Dockerfile
+  #   container_name: msghub_frontend
+  #   ports:
+  #     - "3000:80"
+  #   depends_on:
+  #     - backend
+  #   networks:
+  #     - msghub_network
+  #   restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  msghub_network:
+    driver: bridge

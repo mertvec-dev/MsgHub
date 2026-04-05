@@ -1,0 +1,30 @@
+# Приложение (сердце)
+fastapi
+uvicorn
+websockets
+
+# БД
+sqlmodel
+asyncpg
+
+# Redis
+redis
+
+# Валидация
+pydantic
+pydantic[email]
+pydantic-settings
+
+# Безопасность
+python-jose[cryptography]
+bcrypt==4.0.1
+passlib[bcrypt]==1.7.4
+
+# Окружение
+python-dotenv
+
+# Rate Limiting
+slowapi
+
+# Криптография
+cryptography
