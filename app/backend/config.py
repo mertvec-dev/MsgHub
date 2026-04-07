@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str  # Полный URL: postgresql+asyncpg://user:pass@host:port/db
 
     # ─── Redis ───
+    REDIS_PASSWORD: str | None = None
     REDIS_URL: str  # redis://host:port/db
 
     # ─── JWT (аутентификация) ───

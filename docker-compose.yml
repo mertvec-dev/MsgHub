@@ -20,12 +20,14 @@ services:
 
   redis: # Redis
     image: redis:7-alpine
-    command: redis-server --appendonly yes
+    command: ["sh", "-c", "redis-server --appendonly yes --requirepass \"$REDIS_PASSWORD\""]
     container_name: msghub_redis
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
     networks:
       - msghub_network
     healthcheck: # Проверка работоспособности Redis
-      test: ["CMD", "redis-cli", "ping"] # Команда для проверки работоспособности Redis
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping"] # Команда для проверки работоспособности Redis
       interval: 10s # Интервал между проверками
       timeout: 5s # Таймаут проверки
       retries: 5 # Количество попыток
@@ -60,7 +62,7 @@ services:
       # TODO: раскомментировать порт при отправке на ВМ: - "443:443"
     volumes:
       - ./nginx.conf/nginx.conf:/etc/nginx/nginx.conf:ro
-      # - ./app/frontend/dist:/usr/share/nginx/html:ro # Статика фронтенда
+      - ./app/frontend/dist:/usr/share/nginx/html:ro # Статика фронтенда
       # - ./infrastructure/nginx/certs:/etc/nginx/certs:ro # Сертификаты
     depends_on:
       backend:

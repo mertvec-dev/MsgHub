@@ -78,7 +78,8 @@ npm run build
 |------------|----------|
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `DB_NAME` | Учётные данные БД (для сервиса `db` в Compose) |
 | `DATABASE_URL` | SQLAlchemy async URL, например `postgresql+asyncpg://USER:PASS@db:5432/DB_NAME` в Docker |
-| `REDIS_URL` | Например `redis://redis:6379/0` в Docker |
+| `REDIS_PASSWORD` | Пароль Redis (обязателен при `requirepass`) |
+| `REDIS_URL` | Например `redis://:REDIS_PASSWORD@redis:6379/0` в Docker |
 | `SECRET_KEY` | Секрет подписи JWT (не коммитить реальное значение) |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Срок жизни access (по умолчанию 30) |
 | `REFRESH_TOKEN_EXPIRE_DAYS` / `SESSION_EXPIRE_DAYS` | Срок refresh и сессии в БД |

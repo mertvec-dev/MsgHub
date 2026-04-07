@@ -20,12 +20,14 @@ services:
 
   redis: # Redis
     image: redis:7-alpine
-    command: redis-server --appendonly yes
+    command: ["sh", "-c", "redis-server --appendonly yes --requirepass \"$REDIS_PASSWORD\""]
     container_name: msghub_redis
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
     networks:
       - msghub_network
     healthcheck: # Проверка работоспособности Redis
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping"]
       interval: 10s
       timeout: 5s
       retries: 5
