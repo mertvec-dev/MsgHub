@@ -1,6 +1,8 @@
 import axios, { type AxiosError, type InternalAxiosRequestConfig } from 'axios';
 
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost';
+const API_URL =
+  import.meta.env.VITE_API_URL ??
+  (typeof window !== 'undefined' ? window.location.origin : 'http://localhost');
 let accessToken: string | null = null;
 
 /** Один общий refresh на параллельные 401 */

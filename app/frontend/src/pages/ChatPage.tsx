@@ -425,7 +425,11 @@ export default function ChatPage() {
     return roomKeyB64;
   }, [getCachedRoomKey, putCachedRoomKey]);
 
-  const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost/ws';
+  const WS_URL =
+    import.meta.env.VITE_WS_URL ??
+    (typeof window !== 'undefined'
+      ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
+      : 'ws://localhost/ws');
 
   // WebSocket подключение
   useEffect(() => {
