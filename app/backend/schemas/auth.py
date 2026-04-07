@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import datetime
 import re
@@ -8,7 +8,6 @@ class RegisterRequest(BaseModel):
     """Схема для регистрации нового пользователя"""
     nickname: str = Field(..., min_length=3, max_length=50)
     username: str = Field(..., min_length=3, max_length=50)
-    email: Optional[EmailStr] = None
     password: str = Field(..., min_length=8, max_length=128)
 
     @field_validator("nickname", "username")
@@ -33,18 +32,14 @@ class LoginRequest(BaseModel):
 
 class TokenResponse(BaseModel):
     """
-    Пара токенов и id пользователя.
+    Данные авторизации для клиента.
 
     Используется в ответах POST /auth/register, /auth/login и /auth/refresh.
-    Поле user_id дублирует claim в access_token — удобно клиенту без разбора JWT.
+    refresh_token хранится только в HttpOnly-cookie, в JSON не возвращается.
     """
     access_token: str
-    refresh_token: str
     token_type: str = "bearer"
     user_id: int
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
 
 # === Сессии ===
 class SessionInfo(BaseModel):

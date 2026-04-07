@@ -6,6 +6,7 @@ websockets
 # БД
 sqlmodel
 asyncpg
+alembic
 
 # Redis
 redis

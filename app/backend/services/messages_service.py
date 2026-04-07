@@ -26,8 +26,6 @@ from database.models.rooms import Room
 from database.models.room_member import RoomMember
 from database.models.users import User
 
-from app.backend.utils.crypto import crypto_manager
-
 
 # ============================================================================
 # СЕРВИС
@@ -42,13 +40,20 @@ class MessageService:
     # ОТПРАВКА СООБЩЕНИЯ
     # ==========================================================================
 
-    async def send_message(self, sender_id: int, room_id: int, content: str) -> Message:
+    async def send_message(
+        self,
+        sender_id: int,
+        room_id: int,
+        content: str,
+        nonce: str,
+        key_version: Optional[int] = None,
+    ) -> Message:
         """
         Создаёт новое сообщение в комнате.
 
         Шаги:
         1. Проверяет что отправитель состоит в комнате (JOIN RoomMember + Room).
-        2. Шифрует контент через Fernet.
+        2. Проверяет E2E-данные (ciphertext + nonce + key_version).
         3. Сохраняет сообщение в БД.
         4. Обновляет updated_at комнаты (для сортировки чатов по последнему сообщению).
         5. Коммитит всё в одной транзакции.
@@ -70,17 +75,15 @@ class MessageService:
             if not row:
                 raise ValueError("Вы не являетесь участником этой комнаты")
 
-            member, room = row
-
-            # 2. Шифруем контент (Fernet AES)
-            encrypted_content = await crypto_manager.encrypt_message_async(content)
+            _member, room = row
 
             # 3. Создаём сообщение
             message = Message(
                 room_id=room_id,
                 sender_id=sender_id,
-                content=content,               # Открытый текст (в БД для чтения)
-                encrypted_content=encrypted_content,  # Зашифрованная копия
+                content=content,  # ciphertext
+                nonce=nonce,
+                key_version=key_version or getattr(room, "current_key_version", 1) or 1,
             )
             session.add(message)
 
@@ -112,8 +115,8 @@ class MessageService:
         - cursor=123 → 50 сообщений СТАРШЕ сообщения с ID=123 (скролл вверх).
 
         **Почему cursor, а не offset?**
-        Offset медленный на больших таблицах (пропускает N строк).
-        Cursor использует индекс по ID — O(log N) вместо O(N).
+        - Offset медленный на больших таблицах (пропускает N строк).
+        - Cursor использует индекс по ID — O(log N) вместо O(N).
 
         **Возвращаемый формат:**
         - messages: список сообщений (от старых к новым — для UI).
@@ -151,8 +154,6 @@ class MessageService:
             # 5. Разворачиваем массив — в UI сообщения идут от старых к новым
             messages: List[Dict[str, Any]] = []
             for msg, nickname in reversed(rows):
-                # Свои сообщения: ✓✓ если кто-то из других участников прочитал (есть message_reads не от отправителя).
-                # Чужие: отметка «я прочитал» — для бейджей на фронте не используется.
                 if msg.sender_id == user_id:
                     is_read_res = await session.execute(
                         select(MessageRead.id).where(
@@ -174,7 +175,9 @@ class MessageService:
                     "room_id": msg.room_id,
                     "sender_id": msg.sender_id,
                     "sender_nickname": nickname,
-                    "content": msg.content,
+                    "content": msg.content,  # ciphertext
+                    "nonce": msg.nonce,
+                    "key_version": msg.key_version,
                     "is_edited": msg.is_edited,
                     "is_read": is_read,
                     "edited_at": msg.edited_at.isoformat() if msg.edited_at else None,
@@ -204,8 +207,9 @@ class MessageService:
 
     async def get_last_message_preview(self, room_id: int) -> Optional[Dict[str, Any]]:
         """
-        Возвращает последнее сообщение комнаты.
-        Нужно для отображения превью в списке чатов ("Последнее: ...").
+        Возвращает последнее сообщение комнаты
+
+        Нужно для отображения превью в списке чатов ("Последнее: ...")
         """
         async for session in db_engine.get_async_session():
             result = await session.execute(
@@ -222,7 +226,9 @@ class MessageService:
             msg, nickname = row
             return {
                 "sender_nickname": nickname,
-                "content": msg.content,
+                "content": msg.content,  # ciphertext
+                "nonce": msg.nonce,
+                "key_version": msg.key_version,
                 "created_at": msg.created_at.isoformat() if msg.created_at else None,
             }
 
@@ -230,15 +236,22 @@ class MessageService:
     # РЕДАКТИРОВАНИЕ
     # ==========================================================================
 
-    async def edit_message(self, message_id: int, user_id: int, new_content: str) -> Message:
+    async def edit_message(
+        self,
+        message_id: int,
+        user_id: int,
+        new_content: str,
+        nonce: str,
+        key_version: Optional[int] = None,
+    ) -> Message:
         """
         Редактирует текст сообщения.
 
         Шаги:
         1. Находит сообщение по ID.
         2. Проверяет что текущий пользователь — автор.
-        3. Шифрует новый контент.
-        4. Обновляет поля: content, encrypted_content, is_edited, edited_at.
+        3. Обновляет E2E-поля.
+        4. Обновляет поля: content, nonce, key_version, is_edited, edited_at.
         5. Коммит.
         """
         async for session in db_engine.get_async_session():
@@ -252,12 +265,11 @@ class MessageService:
             if int(message.sender_id) != int(user_id):
                 raise ValueError("Вы не можете редактировать это сообщение")
 
-            # 3. Шифруем новый контент
-            encrypted_content = await crypto_manager.encrypt_message_async(new_content)
-
             # 4. Обновляем поля
             message.content = new_content
-            message.encrypted_content = encrypted_content
+            message.nonce = nonce
+            if key_version:
+                message.key_version = key_version
             message.is_edited = True
             message.edited_at = datetime.utcnow()
             session.add(message)
@@ -298,7 +310,6 @@ class MessageService:
                 await session.rollback()
                 raise ValueError("Не удалось удалить сообщение (ограничения БД)") from None
             return room_id
-
 
 # Глобальный экземпляр — используется в роутерах
 messages_service = MessageService()

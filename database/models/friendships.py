@@ -2,12 +2,12 @@ from sqlmodel import SQLModel, Field
 from typing import Optional
 from datetime import datetime
 from enum import Enum
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import UniqueConstraint # для уникальности связи между пользователями
 
-class FriendshipStatus(str, Enum): # Перечисление именованных констант
-    PENDING = "pending"
-    ACCEPTED = "accepted"
-    BLOCKED = "blocked"
+class FriendshipStatus(str, Enum): # статусы дружбы
+    PENDING = "pending" # заявка отправлена
+    ACCEPTED = "accepted" # дружба подтверждена
+    BLOCKED = "blocked" # заблокирован
 
 class Friendship(SQLModel, table=True):
     """
@@ -26,7 +26,9 @@ class Friendship(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     sender_id: int = Field(foreign_key="users.id", index=True)
     receiver_id: int = Field(foreign_key="users.id", index=True)
+
     status: FriendshipStatus = Field(default=FriendshipStatus.PENDING, index=True)
+
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     

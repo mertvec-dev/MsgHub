@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 # Сервис сообщений — бизнес-логика
 from app.backend.services.messages_service import messages_service
+from app.backend.schemas.messages import MessageCreate, MessageEditRequest
 
 # Сервис уведомлений — пометка прочитанных
 from app.backend.services.notification_service import notification_service
@@ -64,6 +65,7 @@ async def _notify_messages_read(room_id: int, reader_id: int) -> None:
     summary="Счётчик непрочитанных",
     description="Количество непрочитанных сообщений по каждой комнате"
 )
+@limiter.limit(settings.RATE_LIMIT_DEFAULT)
 async def get_unread_count(request: Request, user_id: int = Depends(get_current_user)):
     """
     Возвращает словарь {room_id: count} и общую сумму.
@@ -78,6 +80,7 @@ async def get_unread_count(request: Request, user_id: int = Depends(get_current_
     summary="Пометить как прочитанные",
     description="Ручная пометка всех сообщений в комнате как прочитанных"
 )
+@limiter.limit(settings.RATE_LIMIT_DEFAULT)
 async def mark_as_read(request: Request, room_id: int, user_id: int = Depends(get_current_user)):
     """
     Обновляет запись в message_reads, фиксируя время последнего прочтения.
@@ -98,6 +101,7 @@ async def mark_as_read(request: Request, room_id: int, user_id: int = Depends(ge
     summary="Получить сообщения комнаты",
     description="Cursor-based пагинация: от новых к старым"
 )
+@limiter.limit(settings.RATE_LIMIT_DEFAULT)
 async def get_room_messages(
     room_id: int,
     request: Request,
@@ -153,8 +157,7 @@ async def get_room_messages(
 @limiter.limit(settings.RATE_LIMIT_MESSAGE)
 async def send_message(
     request: Request,
-    room_id: int,
-    content: str,
+    payload: MessageCreate,
     user_id: int = Depends(get_current_user),
 ):
     """
@@ -162,7 +165,13 @@ async def send_message(
     """
     try:
         # 1. Сохраняем сообщение в БД
-        msg = await messages_service.send_message(user_id, room_id, content)
+        msg = await messages_service.send_message(
+            sender_id=user_id,
+            room_id=payload.room_id,
+            content=payload.content,
+            nonce=payload.nonce,
+            key_version=payload.key_version,
+        )
 
         # Получаем никнейм отправителя для WebSocket (быстрый запрос)
         async for session in db_engine.get_async_session():
@@ -173,10 +182,12 @@ async def send_message(
         message_data = {
             "action": "new_message",
             "id": msg.id,
-            "room_id": room_id,
+            "room_id": msg.room_id,
             "sender_id": user_id,
             "sender_nickname": sender_nickname,
             "content": msg.content,
+            "nonce": msg.nonce,
+            "key_version": msg.key_version,
             "timestamp": msg.created_at.isoformat() if hasattr(msg.created_at, 'isoformat') else str(msg.created_at),
             "is_edited": msg.is_edited,
         }
@@ -185,15 +196,16 @@ async def send_message(
         await pubsub.publish_message(message_data)
 
         # 4. Отправляем через WebSocket ВСЕМ в комнате (включая отправителя)
-        online = manager.get_users_in_room(room_id)
-        logger.info(f"📡 WebSocket broadcast: room={room_id}, online_users={online}")
-        await manager.broadcast_to_room(message_data, room_id)
+        online = manager.get_users_in_room(msg.room_id)
+        logger.info(f"📡 WebSocket broadcast: room={msg.room_id}, online_users={online}")
+        await manager.broadcast_to_room(message_data, msg.room_id)
         logger.info(f"✅ Broadcast завершён")
 
         return {
             "id": msg.id,
             "content": msg.content,
-            "encrypted": msg.encrypted_content is not None,
+            "nonce": msg.nonce,
+            "key_version": msg.key_version,
             "timestamp": msg.created_at.isoformat() if hasattr(msg.created_at, 'isoformat') else str(msg.created_at),
         }
     except ValueError as e:
@@ -208,9 +220,11 @@ async def send_message(
     summary="Редактировать сообщение",
     description="Изменяет текст сообщения (только автор может)"
 )
+@limiter.limit(settings.RATE_LIMIT_DEFAULT)
 async def edit_message(
+    request: Request,
     message_id: int,
-    new_content: str,
+    payload: MessageEditRequest,
     user_id: int = Depends(get_current_user),
 ):
     """
@@ -218,14 +232,20 @@ async def edit_message(
 
     1. Находит сообщение по ID.
     2. Проверяет что текущий пользователь — автор.
-    3. Шифрует новый контент.
-    4. Обновляет запись в БД (content, encrypted_content, is_edited, edited_at).
+    3. Обновляет E2E-данные сообщения.
+    4. Обновляет запись в БД (content, nonce, key_version, is_edited, edited_at).
     5. Публикует в Redis Pub/Sub.
     6. Отправляет через WebSocket всем в комнате (включая автора — чтобы обновить UI).
     """
     try:
         # 1. Редактируем в БД
-        msg = await messages_service.edit_message(message_id, user_id, new_content)
+        msg = await messages_service.edit_message(
+            message_id=message_id,
+            user_id=user_id,
+            new_content=payload.content,
+            nonce=payload.nonce,
+            key_version=payload.key_version,
+        )
 
         # 2. Подготавливаем данные
         message_data = {
@@ -233,6 +253,8 @@ async def edit_message(
             "id": msg.id,
             "room_id": msg.room_id,
             "content": msg.content,
+            "nonce": msg.nonce,
+            "key_version": msg.key_version,
             "timestamp": msg.edited_at.isoformat() if hasattr(msg.edited_at, 'isoformat') else str(msg.edited_at),
         }
 
@@ -252,7 +274,9 @@ async def edit_message(
 
 
 @router.delete("/{message_id}", summary="Удалить сообщение")
+@limiter.limit(settings.RATE_LIMIT_DEFAULT)
 async def delete_message(
+    request: Request,
     message_id: int,
     user_id: int = Depends(get_current_user),
 ):

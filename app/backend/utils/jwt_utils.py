@@ -13,7 +13,7 @@ JWT (JSON Web Token):
 from datetime import datetime, timezone, timedelta
 
 from jose import jwt, JWTError, ExpiredSignatureError
-from fastapi import HTTPException, Depends, status
+from fastapi import HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from app.backend.config import settings
@@ -49,28 +49,6 @@ def create_access_token(data: dict, expires_delta: timedelta) -> str:
     )
     return token
 
-
-def create_refresh_token(data: dict, expires_delta: timedelta) -> str:
-    """
-    Создаёт refresh-token (JWT).
-
-    По структуре идентичен access-token, но:
-    - Живёт дольше (7 дней).
-    - Хранится в БД (sessions) + Redis.
-    - При использовании — ротируется (одноразовый).
-    """
-    payload = data.copy()
-    expire = datetime.now(timezone.utc) + expires_delta
-    payload.update({"exp": expire})
-
-    token = jwt.encode(
-        payload,
-        key=settings.SECRET_KEY,
-        algorithm=settings.ALGORITHM,
-    )
-    return token
-
-
 def verify_token(token: str) -> dict | None:
     """
     Проверяет JWT-токен.
@@ -97,11 +75,11 @@ def verify_token(token: str) -> dict | None:
 
 # Готовый парсер — автоматически извлекает токен из заголовка:
 #   Authorization: Bearer eyJhbGciOi...
-security = HTTPBearer()
-
+security = HTTPBearer(auto_error=False)
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ) -> int:
     """
     FastAPI-зависимость — извлекает user_id из JWT-токена.
@@ -124,7 +102,13 @@ def get_current_user(
     **Ошибки:**
     - 401 Unauthorized — токен невалиден, просрочен, или нет user_id.
     """
-    token = credentials.credentials  # Строка токена
+    token = credentials.credentials if credentials else request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Токен отсутствует",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     payload = verify_token(token)
 

@@ -9,7 +9,7 @@
   - Отзыв сессий (logout)
   - Трекинг активных сессий
 
-Хранит сессии в PostgreSQL + Redis (для быстрого доступа).
+Хранит сессии в PostgreSQL + Redis (для быстрого доступа)
 """
 
 # ============================================================================
@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.engine import db_engine
 from database.models.users import User
+from database.models.users_public_key import UserPublicKey
 from database.models.sessions import Session as SessionModel
 from database.redis import redis_client
 
@@ -37,7 +38,7 @@ from database.redis import redis_client
 # ============================================================================
 from app.backend.config import settings
 from app.backend.utils.password_validator import validate_password, hash_password, verify_password
-from app.backend.utils.jwt_utils import create_access_token, create_refresh_token, verify_token
+from app.backend.utils.jwt_utils import create_access_token
 
 # ============================================================================
 # ЛОГИРОВАНИЕ
@@ -72,14 +73,13 @@ class AuthService:
         nickname: str,
         username: str,
         password: str,
-        email: Optional[str] = None,
     ) -> dict:
         """
         Создаёт нового пользователя и возвращает токены.
 
         Шаги:
         1. Валидация пароля (сложность).
-        2. Проверка уникальности nickname/username/email.
+        2. Проверка уникальности nickname/username.
         3. Создание записи User в БД.
         4. Создание сессии (refresh_token) в БД.
         5. Кэширование сессии в Redis (быстрая проверка при refresh).
@@ -90,13 +90,11 @@ class AuthService:
             raise ValueError("Слабый пароль")
 
         async with AsyncSession(db_engine.engine) as session:
-            # 1. Проверяем что nickname/username/email свободны
+            # 1. Проверяем что nickname/username свободны
             checks = [
                 (User.nickname == nickname, "Nickname уже занят"),
                 (User.username == username, "Username уже занят"),
             ]
-            if email:
-                checks.append((User.email == email, "Email уже зарегистрирован"))
 
             for condition, error_msg in checks:
                 res = await session.execute(select(User).where(condition))
@@ -108,7 +106,6 @@ class AuthService:
                 nickname=nickname,
                 username=username,
                 password_hash=hash_password(password),
-                email=email,
             )
             session.add(user)
             await session.commit()
@@ -121,7 +118,7 @@ class AuthService:
 
             # 3. Генерируем refresh-токен (случайная строка 64 символа)
             refresh_token = secrets.token_urlsafe(32)
-            # Хэшируем — в БД храним только хэш (как пароль)
+            # Хэшируем токен
             refresh_token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
             expires_at = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
@@ -249,18 +246,21 @@ class AuthService:
 
         **Зачем rotation:**
         Если кто-то украл refresh-токен, то после использования старый токен
-        становится невалидным. Это позволяет обнаружить компрометацию.
+        становится невалидным. Это позволяет обнаружить компрометацию
         """
         token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
         redis_key = f"session:{token_hash}"
 
-        # 1. Быстрая проверка через Redis
-        user_id = await redis_client.get(redis_key)
-        if not user_id:
-            raise ValueError("Сессия не найдена или истекла")
-
         async with AsyncSession(db_engine.engine) as session:
-            # 2. Проверяем в БД — сессия существует и не истекла
+            # 1) Сначала пытаемся быстрый путь через Redis.
+            # Если Redis недоступен/пустой — fallback на БД (сессия может быть валидна).
+            user_id = None
+            try:
+                user_id = await redis_client.get(redis_key)
+            except Exception:
+                user_id = None
+
+            # 2) Проверяем в БД — источник истины по refresh-сессиям.
             res = await session.execute(
                 select(SessionModel).where(
                     SessionModel.refresh_token_hash == token_hash,
@@ -271,8 +271,15 @@ class AuthService:
 
             if not db_session:
                 # Сессия отозвана (logout) или истекла — чистим Redis
-                await redis_client.delete(redis_key)
+                try:
+                    await redis_client.delete(redis_key)
+                except Exception:
+                    pass
                 raise ValueError("Сессия недействительна")
+
+            # Если Redis промахнулся, но БД валидна — используем user_id из БД.
+            if not user_id:
+                user_id = db_session.user_id
 
             # 3. Удаляем старую сессию (rotation — токен одноразовый)
             await session.delete(db_session)
@@ -296,7 +303,7 @@ class AuthService:
             try:
                 await redis_client.set(
                     f"session:{new_token_hash}",
-                    str(user_id),
+                    str(int(user_id)),
                     ex=604800,
                 )
             except Exception:
@@ -363,7 +370,48 @@ class AuthService:
                 ).order_by(SessionModel.last_active_at.desc())
             )
             return res.scalars().all()
+    
+    # ==========================================================================
+    # ПОЛУЧЕНИЕ КЛЮЧА ДЛЯ ШИФРОВАНИЯ
+    # ==========================================================================
+    async def upsert_public_key(self, user_id: int, public_key: str, algorithm: str = "x25519") -> UserPublicKey:
+        """
+        Обновляет публичный ключ E2E для текущего пользователя, или создает новый, если не существует
+        """
+        async for session in db_engine.get_async_session():
+            result = await session.execute(
+                select(UserPublicKey).where(UserPublicKey.user_id == user_id)
+            )
+            user_public_key = result.scalars().first()
 
+            if not user_public_key: # если ключ не существует, создаем новый
+                user_public_key = UserPublicKey( # создаем новый ключ
+                    user_id=user_id,
+                    public_key=public_key,
+                    algorithm=algorithm,
+                )
+            else:
+                user_public_key.public_key = public_key
+                user_public_key.algorithm = algorithm
+
+            # добавляем ключ в БД
+            session.add(user_public_key) # транзакция сразу добавляет ключ в БД
+            await session.commit() # коммитим транзакцию
+            await session.refresh(user_public_key) # обновляем объект ключа
+            return user_public_key
+    
+    async def get_public_key(self, user_id: int) -> UserPublicKey:
+        """
+        Получает публичный ключ E2E для конкретного пользователя
+        """
+        async for session in db_engine.get_async_session():
+            result = await session.execute(
+                select(UserPublicKey).where(UserPublicKey.user_id == user_id)
+            )
+            user_public_key = result.scalars().first()
+            if not user_public_key:
+                raise ValueError("Публичный ключ E2E не найден")
+            return user_public_key
 
 # Глобальный экземпляр — используется в роутерах
 auth_service = AuthService()

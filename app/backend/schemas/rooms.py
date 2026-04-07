@@ -9,8 +9,9 @@ from database.models.room_member import MembershipStatus as MemberStatus
 class RoomCreate(BaseModel):
     """Создание комнаты"""
     name: Optional[str] = Field(default=None, max_length=100)
-    type: RoomType = RoomType.GROUP
-    user_ids: list[int] = []
+    type: RoomType = Field(default=RoomType.GROUP)
+    user_ids: list[int] = Field(default=[])
+    current_key_version: int = Field(default=1)
 
     @field_validator("name")
     @classmethod
@@ -22,10 +23,11 @@ class RoomCreate(BaseModel):
 
 # === Информация о комнате ===
 class RoomResponse(BaseModel):
-    """Информация о комнате (список «мои чаты» может добавлять превью и собеседника в direct)."""
+    """Информация о комнате (список «мои чаты» может добавлять превью и собеседника в direct)"""
     id: int
     name: Optional[str]
     type: RoomType
+    current_key_version: int = Field(default=1)
     created_by: int
     created_at: datetime
     updated_at: datetime
@@ -36,7 +38,7 @@ class RoomResponse(BaseModel):
     partner_username: Optional[str] = None
 
     class Config:
-        from_attributes = True
+        from_attributes = True # Позволяет создавать RoomResponse из ORM-модели Room
 
 
 # === Участник комнаты ===

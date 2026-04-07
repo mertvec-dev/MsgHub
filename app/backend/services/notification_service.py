@@ -16,7 +16,6 @@ from datetime import datetime
 from typing import Dict, List
 
 from sqlmodel import select, text
-from sqlalchemy import func
 
 from database.engine import db_engine
 from database.models.messages import Message

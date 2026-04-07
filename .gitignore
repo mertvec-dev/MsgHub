@@ -59,3 +59,5 @@ logs/
 # Coverage (pytest-cov)
 .coverage
 htmlcov/
+
+smoke_e2e.py

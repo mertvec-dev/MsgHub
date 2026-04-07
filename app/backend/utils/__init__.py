@@ -6,7 +6,6 @@ from app.backend.utils.password_validator import (
 )
 from app.backend.utils.jwt_utils import (
     create_access_token,
-    create_refresh_token,
     verify_token,
     get_current_user,
     security
@@ -28,7 +27,6 @@ __all__ = [
 
     # JWT
     "create_access_token",
-    "create_refresh_token",
     "verify_token",
     "get_current_user",
     "security",

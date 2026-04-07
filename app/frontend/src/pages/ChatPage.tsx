@@ -1,7 +1,31 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
-import { rooms, messages, friends, getRoomSidebarTitle, type Room, type Message } from '../services/api';
+import {
+  rooms,
+  messages,
+  friends,
+  e2e,
+  getRoomSidebarTitle,
+  getAccessToken,
+  type Room,
+  type Message,
+} from '../services/api';
+import {
+  ensureOwnPublicKey,
+  encryptForPeer,
+  decryptFromPeer,
+  encryptForRoom,
+  decryptFromRoom,
+  generateRoomKey,
+  saveRoomKey,
+  loadRoomKey,
+  encryptRoomKeyForMember,
+  decryptRoomKeyEnvelope,
+  hasLocalPrivateKey,
+  clearLocalPrivateKey,
+} from '../services/e2e';
+import { getAlias, setAlias as setLocalAlias } from '../services/localAliases';
 import '../styles/ChatPage.css';
 
 interface FriendRequest {
@@ -47,8 +71,37 @@ function apiErrorDetail(err: unknown, fallback: string): string {
   return fallback;
 }
 
+function randomNonce(length = 12): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
+function encryptedPlaceholder(): string {
+  return '🔒 Encrypted message';
+}
+
+function previewCacheStorageKey(userId: number | null | undefined): string {
+  return `msghub-last-preview-v1:${userId ?? 'anon'}`;
+}
+
+function looksEncryptedPayload(value: string | null | undefined): boolean {
+  if (!value) return false;
+  const trimmed = value.trim();
+  // Грубый эвристический детект base64/ciphertext, чтобы не показывать мусор в превью.
+  return trimmed.length >= 24 && /^[A-Za-z0-9+/=]+$/.test(trimmed);
+}
+
+function preferAlias(userId: number | null | undefined, fallback: string): string {
+  const alias = getAlias(userId);
+  return alias || fallback;
+}
+
 export default function ChatPage() {
-  const { userId, logout } = useAuth();
+  const { userId, logout, profileNickname, profileUsername } = useAuth();
   /** Сообщения с API/WebSocket могут отдавать id как number или string — строгое === ломало класс .own. */
   const isMe = useCallback(
     (id: number | string | undefined | null) =>
@@ -67,6 +120,7 @@ export default function ChatPage() {
   const [hasMoreMessages, setHasMoreMessages] = useState(true);
   const [lastCursor, setLastCursor] = useState<number | undefined>(undefined);
   const messagesListRef = useRef<HTMLDivElement>(null);
+  const myRoomsRef = useRef<Room[]>([]);
 
   // Меню
   const [activeMenu, setActiveMenu] = useState<'chats' | 'friends' | 'requests' | 'settings'>('chats');
@@ -86,6 +140,7 @@ export default function ChatPage() {
   const [showRoomMenu, setShowRoomMenu] = useState(false);
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [inviteUserId, setInviteUserId] = useState('');
+  const [showProfileMenu, setShowProfileMenu] = useState(false);
 
   const messagesEnd = useRef<HTMLDivElement>(null);
   /** Закрытие меню по клику снаружи (см. useEffect ниже) */
@@ -93,22 +148,120 @@ export default function ChatPage() {
   const roomSidebarContextMenuRef = useRef<HTMLDivElement>(null);
   const roomHeaderActionsRef = useRef<HTMLDivElement>(null);
   const roomHeaderDropdownRef = useRef<HTMLDivElement>(null);
+  const profileMenuRef = useRef<HTMLDivElement>(null);
+  const profileButtonRef = useRef<HTMLButtonElement>(null);
   const ws = useRef<WebSocket | null>(null);
   /** Актуальная комната для обработчиков WebSocket (иначе замыкание на старый selectedRoom). */
   const selectedRoomIdRef = useRef<number | null>(null);
+  const selectedRoomTypeRef = useRef<'direct' | 'group' | null>(null);
+  const selectedRoomRef = useRef<Room | null>(null);
+  const activePeerPublicKeyRef = useRef<string | null>(null);
+  const roomKeyCacheRef = useRef<Map<string, string>>(new Map());
+  const peerPublicKeyCacheRef = useRef<Map<number, string>>(new Map());
+  const previewCacheRef = useRef<Map<number, string>>(new Map());
+  const [activePeerPublicKey, setActivePeerPublicKey] = useState<string | null>(null);
+  const [peerKeyRetryTick, setPeerKeyRetryTick] = useState(0);
+  const [aliasDraft, setAliasDraft] = useState('');
+  const [hasE2EKey, setHasE2EKey] = useState<boolean>(false);
   useEffect(() => {
     selectedRoomIdRef.current = selectedRoom?.id ?? null;
-  }, [selectedRoom?.id]);
+    selectedRoomTypeRef.current = selectedRoom?.type ?? null;
+    selectedRoomRef.current = selectedRoom ?? null;
+  }, [selectedRoom]);
+  useEffect(() => {
+    activePeerPublicKeyRef.current = activePeerPublicKey;
+  }, [activePeerPublicKey]);
 
   // Загрузка данных
+  const fetchPeerPublicKey = async (partnerId: number): Promise<string | null> => {
+    const cached = peerPublicKeyCacheRef.current.get(partnerId);
+    if (cached) return cached;
+    try {
+      const res = await e2e.getPublicKey(partnerId);
+      const key = res.data.public_key;
+      peerPublicKeyCacheRef.current.set(partnerId, key);
+      return key;
+    } catch {
+      return null;
+    }
+  };
+
   const loadRooms = async () => {
     try {
       const r = await rooms.getMyRooms();
-      setMyRooms(r.data);
+      const hydrated = r.data.map((room) => {
+        const cached = previewCacheRef.current.get(room.id);
+        if (cached && room.type === 'direct') {
+          return {
+            ...room,
+            last_message: cached,
+          };
+        }
+        return room;
+      });
+      setMyRooms(hydrated);
+      // Прогреваем public keys для direct-чатов в фоне,
+      // чтобы при открытии чата не было задержки/состояния "нет ключа".
+      const partners = r.data
+        .filter((room) => room.type === 'direct' && room.partner_id != null)
+        .map((room) => Number(room.partner_id));
+      void Promise.allSettled(
+        [...new Set(partners)].map(async (partnerId) => {
+          await fetchPeerPublicKey(partnerId);
+        })
+      );
     } catch (e) {
       console.error('Ошибка загрузки комнат:', e);
     }
   };
+
+  useEffect(() => {
+    myRoomsRef.current = myRooms;
+  }, [myRooms]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(previewCacheStorageKey(userId));
+      if (!raw) {
+        previewCacheRef.current = new Map();
+        return;
+      }
+      const parsed = JSON.parse(raw) as Record<string, string>;
+      const map = new Map<number, string>();
+      Object.entries(parsed).forEach(([key, value]) => {
+        const id = Number(key);
+        if (!Number.isNaN(id) && typeof value === 'string' && value.trim()) {
+          map.set(id, value);
+        }
+      });
+      previewCacheRef.current = map;
+    } catch {
+      previewCacheRef.current = new Map();
+    }
+  }, [userId]);
+
+  const setPreviewCache = useCallback((roomId: number, preview: string) => {
+    if (!preview.trim()) return;
+    previewCacheRef.current.set(roomId, preview);
+    try {
+      const obj = Object.fromEntries(previewCacheRef.current.entries());
+      localStorage.setItem(previewCacheStorageKey(userId), JSON.stringify(obj));
+    } catch {
+      // ignore storage errors
+    }
+  }, [userId]);
+
+  const getRoomPreview = useCallback((room: Room): string => {
+    const cached = previewCacheRef.current.get(room.id);
+    if (cached) return cached;
+    if (!room.last_message) return 'Нет сообщений';
+    if (looksEncryptedPayload(room.last_message)) {
+      return room.last_message_sender
+        ? `🔒 ${room.last_message_sender}: encrypted`
+        : '🔒 Encrypted message';
+    }
+    return room.last_message;
+  }, []);
 
   const loadFriendsData = async () => {
     try {
@@ -150,16 +303,136 @@ export default function ChatPage() {
     loadRooms();
     loadFriendsData();
     loadUnreadCounts();
+    setHasE2EKey(hasLocalPrivateKey());
   }, []);
 
-  const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000/ws';
+  // Гарантируем, что у текущего клиента есть E2E public key на сервере.
+  useEffect(() => {
+    if (!userId) return;
+    void (async () => {
+      try {
+        const { publicKeyB64 } = await ensureOwnPublicKey();
+        await e2e.upsertPublicKey(publicKeyB64);
+        setHasE2EKey(true);
+      } catch (err) {
+        console.error('Не удалось инициализировать E2E ключ:', err);
+      }
+    })();
+  }, [userId]);
+
+  // Для direct-чата подтягиваем публичный ключ собеседника.
+  useEffect(() => {
+    const partnerId = selectedRoom?.partner_id;
+    if (!selectedRoom || selectedRoom.type !== 'direct' || partnerId == null) {
+      setActivePeerPublicKey(null);
+      return;
+    }
+    void (async () => {
+      const cached = peerPublicKeyCacheRef.current.get(partnerId);
+      if (cached) {
+        setActivePeerPublicKey(cached);
+        return;
+      }
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const key = await fetchPeerPublicKey(partnerId);
+          if (!key) throw new Error('no-key');
+          setActivePeerPublicKey(key);
+          return;
+        } catch (err) {
+          if (attempt === 3) {
+            setActivePeerPublicKey(null);
+            console.error('Не удалось получить public key собеседника:', err);
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 800));
+        }
+      }
+    })();
+  }, [selectedRoom?.id, selectedRoom?.type, selectedRoom?.partner_id, peerKeyRetryTick]);
+
+  // Если ключ собеседника временно недоступен (еще не загрузился/не опубликован),
+  // периодически повторяем попытку, чтобы шифрование/дешифрование оживало без перезагрузки страницы.
+  useEffect(() => {
+    if (!selectedRoom || selectedRoom.type !== 'direct' || selectedRoom.partner_id == null) return;
+    if (activePeerPublicKey) return;
+    const t = setTimeout(() => setPeerKeyRetryTick((v) => v + 1), 3000);
+    return () => clearTimeout(t);
+  }, [selectedRoom?.id, selectedRoom?.type, selectedRoom?.partner_id, activePeerPublicKey]);
+
+  const getCachedRoomKey = useCallback((roomId: number, keyVersion: number): string | null => {
+    const cacheKey = `${roomId}:${keyVersion}`;
+    const cached = roomKeyCacheRef.current.get(cacheKey);
+    if (cached) return cached;
+    const persisted = loadRoomKey(roomId, keyVersion);
+    if (persisted) {
+      roomKeyCacheRef.current.set(cacheKey, persisted);
+      return persisted;
+    }
+    return null;
+  }, []);
+
+  const putCachedRoomKey = useCallback((roomId: number, keyVersion: number, roomKeyB64: string) => {
+    const cacheKey = `${roomId}:${keyVersion}`;
+    roomKeyCacheRef.current.set(cacheKey, roomKeyB64);
+    saveRoomKey(roomId, keyVersion, roomKeyB64);
+  }, []);
+
+  const ensureGroupRoomKey = useCallback(async (room: Room, keyVersion: number): Promise<string | null> => {
+    if (room.type !== 'group') return null;
+
+    const existing = getCachedRoomKey(room.id, keyVersion);
+    if (existing) return existing;
+
+    // Пробуем получить и расшифровать конверт текущей версии с сервера.
+    if (keyVersion === room.current_key_version) {
+      try {
+        const envelopeRes = await rooms.getMyRoomKey(room.id);
+        const roomKeyB64 = await decryptRoomKeyEnvelope(envelopeRes.data.encrypted_key);
+        putCachedRoomKey(room.id, envelopeRes.data.key_version, roomKeyB64);
+        if (envelopeRes.data.key_version === keyVersion) return roomKeyB64;
+      } catch {
+        // Если конверта нет, попробуем bootstrap новой версии ниже.
+      }
+    }
+
+    // Для старых версий без локального кэша ключ получить неоткуда (API отдает только current).
+    if (keyVersion !== room.current_key_version) return null;
+
+    // Bootstrap: генерируем room-key и разворачиваем конверты на всех участников.
+    const membersRes = await rooms.getMembers(room.id);
+    const members = (membersRes.data || []) as RoomMember[];
+    if (!members.length) throw new Error('Не удалось загрузить участников комнаты');
+
+    const roomKeyB64 = generateRoomKey();
+    const envelopes = await Promise.all(
+      members.map(async (member) => {
+        const pk = await e2e.getPublicKey(member.id);
+        const encryptedKey = await encryptRoomKeyForMember(roomKeyB64, pk.data.public_key);
+        return {
+          user_id: member.id,
+          encrypted_key: encryptedKey,
+          algorithm: 'p256-ecdh-v1',
+        };
+      })
+    );
+
+    await rooms.upsertRoomKeys(room.id, {
+      key_version: keyVersion,
+      envelopes,
+    });
+    putCachedRoomKey(room.id, keyVersion, roomKeyB64);
+    return roomKeyB64;
+  }, [getCachedRoomKey, putCachedRoomKey]);
+
+  const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost/ws';
 
   // WebSocket подключение
   useEffect(() => {
     if (!userId) return;
-    const token = localStorage.getItem('access_token');
+    const token = getAccessToken();
     if (!token) {
-      console.error("❌ Нет токена в localStorage, WebSocket не подключится");
+      console.error("❌ Нет access token в памяти, WebSocket не подключится");
       return;
     }
 
@@ -196,33 +469,175 @@ export default function ChatPage() {
           case 'new_message':
             if (sameId(data.room_id, roomOpen)) {
               const nickname = data.sender_nickname || (isMe(data.sender_id) ? 'Вы' : 'Пользователь');
-              setMsgList((prev) => {
-                if (prev.some((m) => sameId(m.id, data.id))) return prev;
-                return [...prev, {
-                  id: data.id,
-                  sender_id: data.sender_id,
-                  sender_nickname: nickname,
-                  content: data.content,
-                  room_id: data.room_id,
-                  created_at: data.timestamp,
-                  is_edited: data.is_edited ?? false,
-                  is_read: isMe(data.sender_id),
-                  edited_at: null
-                }];
-              });
+              void (async () => {
+                let resolvedContent = String(data.content ?? '');
+                if (selectedRoomTypeRef.current === 'direct') {
+                  if (!activePeerPublicKeyRef.current) {
+                    resolvedContent = encryptedPlaceholder();
+                  } else {
+                    try {
+                      resolvedContent = await decryptFromPeer(
+                        String(data.content ?? ''),
+                        String(data.nonce ?? ''),
+                        activePeerPublicKeyRef.current
+                      );
+                    } catch {
+                      resolvedContent = encryptedPlaceholder();
+                    }
+                  }
+                } else if (selectedRoomTypeRef.current === 'group' && selectedRoomRef.current) {
+                  try {
+                    const keyVersion = Number(data.key_version ?? selectedRoomRef.current.current_key_version ?? 1);
+                    const roomKeyB64 = await ensureGroupRoomKey(selectedRoomRef.current, keyVersion);
+                    if (!roomKeyB64) {
+                      resolvedContent = encryptedPlaceholder();
+                    } else {
+                      resolvedContent = await decryptFromRoom(
+                        String(data.content ?? ''),
+                        String(data.nonce ?? ''),
+                        roomKeyB64
+                      );
+                    }
+                  } catch {
+                    resolvedContent = encryptedPlaceholder();
+                  }
+                }
+                setMyRooms((prev) => {
+                  const idx = prev.findIndex((r) => sameId(r.id, data.room_id));
+                  if (idx === -1) return prev;
+                  const next = [...prev];
+                  const target = next[idx];
+                  next[idx] = {
+                    ...target,
+                    last_message: resolvedContent,
+                    last_message_sender: data.sender_nickname ?? target.last_message_sender ?? null,
+                    updated_at: data.timestamp ?? new Date().toISOString(),
+                  };
+                  next.sort(
+                    (a, b) =>
+                      new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+                  );
+                  return next;
+                });
+                setPreviewCache(Number(data.room_id), resolvedContent);
+                setMsgList((prev) => {
+                  if (prev.some((m) => sameId(m.id, data.id))) return prev;
+                  return [...prev, {
+                    id: data.id,
+                    sender_id: data.sender_id,
+                    sender_nickname: nickname,
+                    content: resolvedContent,
+                    nonce: data.nonce ?? randomNonce(12),
+                    key_version: Number(data.key_version ?? 1),
+                    room_id: data.room_id,
+                    created_at: data.timestamp,
+                    is_edited: data.is_edited ?? false,
+                    is_read: isMe(data.sender_id),
+                    edited_at: null
+                  }];
+                });
+              })();
               if (!isMe(data.sender_id)) {
                 messages.markAsRead(data.room_id).catch(console.error);
               }
             } else {
-              showToast(`Новое сообщение в комнате #${data.room_id}`, 'info');
+              void (async () => {
+                const targetRoom = myRoomsRef.current.find((r) => sameId(r.id, data.room_id));
+                let resolvedPreview = String(data.content ?? '');
+                try {
+                  if (
+                    targetRoom &&
+                    targetRoom.type === 'direct' &&
+                    targetRoom.partner_id != null &&
+                    typeof data.nonce === 'string'
+                  ) {
+                    const peerKey = await fetchPeerPublicKey(Number(targetRoom.partner_id));
+                    if (peerKey) {
+                      resolvedPreview = await decryptFromPeer(
+                        String(data.content ?? ''),
+                        String(data.nonce ?? ''),
+                        peerKey
+                      );
+                      setPreviewCache(Number(data.room_id), resolvedPreview);
+                    }
+                  }
+                } catch {
+                  // keep ciphertext fallback for this tick
+                }
+                setMyRooms((prev) => {
+                  const idx = prev.findIndex((r) => sameId(r.id, data.room_id));
+                  if (idx === -1) return prev;
+                  const next = [...prev];
+                  const target = next[idx];
+                  next[idx] = {
+                    ...target,
+                    last_message: resolvedPreview,
+                    last_message_sender: data.sender_nickname ?? target.last_message_sender ?? null,
+                    updated_at: data.timestamp ?? new Date().toISOString(),
+                  };
+                  next.sort(
+                    (a, b) =>
+                      new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+                  );
+                  return next;
+                });
+              })();
+              const targetRoom = myRoomsRef.current.find((r) => sameId(r.id, data.room_id));
+              const roomTitle = targetRoom
+                ? getRoomSidebarTitle(targetRoom)
+                : `комната #${data.room_id}`;
+              showToast(`Новое сообщение: ${roomTitle}`, 'info');
               loadRooms();
             }
             break;
           case 'message_edited':
             if (sameId(data.room_id, roomOpen)) {
-              setMsgList((prev) => prev.map((msg) =>
-                sameId(msg.id, data.id) ? { ...msg, content: data.content, is_edited: true, edited_at: data.timestamp } : msg
-              ));
+              void (async () => {
+                let resolvedContent = String(data.content ?? '');
+                if (selectedRoomTypeRef.current === 'direct') {
+                  if (!activePeerPublicKeyRef.current) {
+                    resolvedContent = encryptedPlaceholder();
+                  } else {
+                    try {
+                      resolvedContent = await decryptFromPeer(
+                        String(data.content ?? ''),
+                        String(data.nonce ?? ''),
+                        activePeerPublicKeyRef.current
+                      );
+                    } catch {
+                      resolvedContent = encryptedPlaceholder();
+                    }
+                  }
+                } else if (selectedRoomTypeRef.current === 'group' && selectedRoomRef.current) {
+                  try {
+                    const keyVersion = Number(data.key_version ?? selectedRoomRef.current.current_key_version ?? 1);
+                    const roomKeyB64 = await ensureGroupRoomKey(selectedRoomRef.current, keyVersion);
+                    if (!roomKeyB64) {
+                      resolvedContent = encryptedPlaceholder();
+                    } else {
+                      resolvedContent = await decryptFromRoom(
+                        String(data.content ?? ''),
+                        String(data.nonce ?? ''),
+                        roomKeyB64
+                      );
+                    }
+                  } catch {
+                    resolvedContent = encryptedPlaceholder();
+                  }
+                }
+                setMsgList((prev) => prev.map((msg) =>
+                  sameId(msg.id, data.id)
+                    ? {
+                        ...msg,
+                        content: resolvedContent,
+                        nonce: data.nonce ?? msg.nonce,
+                        key_version: Number(data.key_version ?? msg.key_version),
+                        is_edited: true,
+                        edited_at: data.timestamp,
+                      }
+                    : msg
+                ));
+              })();
             }
             break;
           case 'message_deleted':
@@ -287,6 +702,11 @@ export default function ChatPage() {
     setLastCursor(undefined);
     setHasMoreMessages(true);
     setMsgList([]);
+    if (selectedRoom.type === 'group') {
+      void ensureGroupRoomKey(selectedRoom, selectedRoom.current_key_version).catch((err) => {
+        console.error('Не удалось подготовить group room key:', err);
+      });
+    }
     loadMessages(false);
     loadRoomMembers(selectedRoom.id);
 
@@ -296,7 +716,7 @@ export default function ChatPage() {
     }, 1500);
 
     return () => clearTimeout(timer);
-  }, [selectedRoom]);
+  }, [selectedRoom, ensureGroupRoomKey]);
 
   // Загрузка сообщений с cursor (API: от старых к новым — как в мессенджере, сверху вниз)
   const loadMessages = useCallback(async (append = false) => {
@@ -306,12 +726,52 @@ export default function ChatPage() {
     try {
       const cursor = append ? lastCursor : undefined;
       const r = await messages.get(selectedRoom.id, 50, cursor);
-      const newMsgs = r.data.messages || [];
+      const newMsgs = (r.data.messages || []) as Message[];
+      const normalizedMsgs: Message[] = await Promise.all(
+        newMsgs.map(async (m) => {
+          if (selectedRoom.type === 'direct') {
+            if (!activePeerPublicKey) return { ...m, content: encryptedPlaceholder() };
+            try {
+              const plain = await decryptFromPeer(m.content, m.nonce, activePeerPublicKey);
+              return { ...m, content: plain };
+            } catch {
+              return { ...m, content: encryptedPlaceholder() };
+            }
+          }
+          if (selectedRoom.type === 'group') {
+            try {
+              const roomKeyB64 = await ensureGroupRoomKey(selectedRoom, Number(m.key_version ?? selectedRoom.current_key_version ?? 1));
+              if (!roomKeyB64) return { ...m, content: encryptedPlaceholder() };
+              const plain = await decryptFromRoom(m.content, m.nonce, roomKeyB64);
+              return { ...m, content: plain };
+            } catch {
+              return { ...m, content: encryptedPlaceholder() };
+            }
+          }
+          return m;
+        })
+      );
 
       if (append) {
-        setMsgList((prev) => [...newMsgs, ...prev]);
+        setMsgList((prev) => [...normalizedMsgs, ...prev]);
       } else {
-        setMsgList(newMsgs);
+        setMsgList(normalizedMsgs);
+        if (normalizedMsgs.length > 0) {
+          const latest = normalizedMsgs[normalizedMsgs.length - 1];
+          setPreviewCache(selectedRoom.id, latest.content);
+          setMyRooms((prev) =>
+            prev.map((room) =>
+              room.id === selectedRoom.id
+                ? {
+                    ...room,
+                    last_message: latest.content,
+                    last_message_sender: latest.sender_nickname ?? room.last_message_sender ?? null,
+                    updated_at: latest.created_at ?? room.updated_at,
+                  }
+                : room
+            )
+          );
+        }
       }
 
       setHasMoreMessages(r.data.has_more ?? true);
@@ -321,7 +781,15 @@ export default function ChatPage() {
     } finally {
       setLoadingMore(false);
     }
-  }, [selectedRoom, lastCursor]);
+  }, [selectedRoom, lastCursor, activePeerPublicKey, ensureGroupRoomKey]);
+
+  // В direct-чате после перезахода ключ собеседника может приехать позже, чем первая загрузка истории.
+  // Как только ключ появился — перезагружаем сообщения, чтобы они сразу расшифровались.
+  useEffect(() => {
+    if (!selectedRoom || selectedRoom.type !== 'direct') return;
+    if (!activePeerPublicKey) return;
+    void loadMessages(false);
+  }, [selectedRoom?.id, selectedRoom?.type, activePeerPublicKey, loadMessages]);
 
   // Обработка скролла вверх (подгрузка старых сообщений)
   const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
@@ -340,9 +808,11 @@ export default function ChatPage() {
   const getDirectRoomName = (room: Room): string => {
     if (room.type !== 'direct') return room.name || 'Без названия';
     const fromApi = getRoomSidebarTitle(room);
+    const alias = getAlias(room.partner_id);
+    if (alias) return alias;
     if (fromApi !== 'Личная переписка') return fromApi;
     const other = roomMembers.find((m) => !isMe(m.id));
-    return other?.nickname || other?.username || 'Личная переписка';
+    return preferAlias(other?.id, other?.nickname || other?.username || 'Личная переписка');
   };
 
   // Отправка сообщения
@@ -351,9 +821,28 @@ export default function ChatPage() {
     setIsSending(true);
     const text = input.trim();
     try {
-      const res = await messages.send(selectedRoom.id, text);
+      const isDirect = selectedRoom.type === 'direct';
+      if (isDirect && !activePeerPublicKey) {
+        showToast('Нет E2E-ключа собеседника', 'error');
+        return;
+      }
+      const encrypted = isDirect
+        ? await encryptForPeer(text, activePeerPublicKey as string)
+        : await (async () => {
+            const keyVersion = Number(selectedRoom.current_key_version ?? 1);
+            const roomKeyB64 = await ensureGroupRoomKey(selectedRoom, keyVersion);
+            if (!roomKeyB64) throw new Error('Не удалось получить room-key для группы');
+            return encryptForRoom(text, roomKeyB64, keyVersion);
+          })();
+
+      const res = await messages.send({
+        room_id: selectedRoom.id,
+        content: encrypted.content,
+        nonce: encrypted.nonce,
+        key_version: encrypted.key_version,
+      });
       setInput('');
-      const data = res.data as { id: number; content: string; timestamp?: string };
+      const data = res.data as { id: number; content: string; nonce?: string; key_version?: number; timestamp?: string };
       setMsgList((prev) => {
         if (prev.some((m) => sameId(m.id, data.id))) return prev;
         return [...prev, {
@@ -361,13 +850,28 @@ export default function ChatPage() {
           room_id: selectedRoom.id,
           sender_id: userId!,
           sender_nickname: 'Вы',
-          content: data.content,
+          content: text, // локально показываем расшифрованный текст
+          nonce: data.nonce ?? encrypted.nonce,
+          key_version: Number(data.key_version ?? encrypted.key_version),
           created_at: data.timestamp ?? new Date().toISOString(),
           is_edited: false,
           edited_at: null,
           is_read: false,
         }];
       });
+      setMyRooms((prev) =>
+        prev.map((room) =>
+          room.id === selectedRoom.id
+            ? {
+                ...room,
+                last_message: text,
+                last_message_sender: 'Вы',
+                updated_at: data.timestamp ?? new Date().toISOString(),
+              }
+            : room
+        )
+      );
+      setPreviewCache(selectedRoom.id, text);
     } catch (e: unknown) {
       const err = e as { response?: { status?: number; data?: { detail?: string } } };
       if (err.response?.status === 429) {
@@ -383,6 +887,64 @@ export default function ChatPage() {
     }
   };
 
+  const saveAliasForCurrentDirect = () => {
+    if (!selectedRoom || selectedRoom.type !== 'direct' || !selectedRoom.partner_id) return;
+    setLocalAlias(selectedRoom.partner_id, aliasDraft);
+    setAliasDraft('');
+    showToast('Локальный псевдоним сохранен', 'success');
+    // Триггерим ререндер через shallow-update комнат (данные не меняем)
+    setMyRooms((prev) => [...prev]);
+  };
+
+  const rotateLocalE2EKey = async () => {
+    try {
+      clearLocalPrivateKey();
+      const { publicKeyB64 } = await ensureOwnPublicKey();
+      await e2e.upsertPublicKey(publicKeyB64);
+      setHasE2EKey(true);
+      showToast('Локальный E2E-ключ обновлен', 'success');
+    } catch (err) {
+      console.error(err);
+      showToast('Не удалось обновить E2E-ключ', 'error');
+    }
+  };
+
+  const rotateGroupE2EKey = async () => {
+    if (!selectedRoom || selectedRoom.type !== 'group') return;
+    try {
+      const rotateRes = await rooms.rotateRoomKey(selectedRoom.id);
+      const newVersion = Number(rotateRes.data.current_key_version);
+      const membersRes = await rooms.getMembers(selectedRoom.id);
+      const members = (membersRes.data || []) as RoomMember[];
+      const roomKeyB64 = generateRoomKey();
+      const envelopes = await Promise.all(
+        members.map(async (member) => {
+          const pk = await e2e.getPublicKey(member.id);
+          const encryptedKey = await encryptRoomKeyForMember(roomKeyB64, pk.data.public_key);
+          return {
+            user_id: member.id,
+            encrypted_key: encryptedKey,
+            algorithm: 'p256-ecdh-v1',
+          };
+        })
+      );
+      await rooms.upsertRoomKeys(selectedRoom.id, {
+        key_version: newVersion,
+        envelopes,
+      });
+      putCachedRoomKey(selectedRoom.id, newVersion, roomKeyB64);
+      setSelectedRoom((prev) => (prev ? { ...prev, current_key_version: newVersion } : prev));
+      setMyRooms((prev) =>
+        prev.map((room) =>
+          room.id === selectedRoom.id ? { ...room, current_key_version: newVersion } : room
+        )
+      );
+      showToast('Групповой E2E-ключ ротирован', 'success');
+    } catch (e: unknown) {
+      showToast(apiErrorDetail(e, 'Не удалось выполнить ротацию E2E-ключа'), 'error');
+    }
+  };
+
   // Редактирование сообщения
   const editMsg = async (msgId: number, newContent: string) => {
     if (!selectedRoom) return;
@@ -392,15 +954,52 @@ export default function ChatPage() {
       return;
     }
     try {
-      await messages.edit(Number(msgId), trimmed);
+      const current = msgList.find((m) => sameId(m.id, msgId));
+      const isDirect = selectedRoom.type === 'direct';
+      if (isDirect && !activePeerPublicKey) {
+        showToast('Нет E2E-ключа собеседника', 'error');
+        return;
+      }
+      const encrypted = isDirect
+        ? await encryptForPeer(trimmed, activePeerPublicKey as string)
+        : await (async () => {
+            const keyVersion = Number(current?.key_version ?? selectedRoom.current_key_version ?? 1);
+            const roomKeyB64 = await ensureGroupRoomKey(selectedRoom, keyVersion);
+            if (!roomKeyB64) throw new Error('Не удалось получить room-key для группы');
+            return encryptForRoom(trimmed, roomKeyB64, keyVersion);
+          })();
+      await messages.edit(Number(msgId), {
+        content: encrypted.content,
+        nonce: encrypted.nonce,
+        key_version: encrypted.key_version,
+      });
       const now = new Date().toISOString();
       setMsgList((prev) =>
         prev.map((m) =>
           sameId(m.id, msgId)
-            ? { ...m, content: trimmed, is_edited: true, edited_at: now }
+            ? {
+                ...m,
+                content: trimmed,
+                nonce: encrypted.nonce,
+                key_version: encrypted.key_version,
+                is_edited: true,
+                edited_at: now,
+              }
             : m
         )
       );
+      setMyRooms((prev) =>
+        prev.map((room) =>
+          room.id === selectedRoom.id
+            ? {
+                ...room,
+                last_message: trimmed,
+                updated_at: now,
+              }
+            : room
+        )
+      );
+      setPreviewCache(selectedRoom.id, trimmed);
       setEditingMsg(null);
       showToast('Сообщение отредактировано', 'success');
     } catch (e: unknown) {
@@ -500,6 +1099,12 @@ export default function ChatPage() {
 
       if (!msgContextMenuRef.current?.contains(el)) setContextMenu(null);
       if (!roomSidebarContextMenuRef.current?.contains(el)) setRoomContextMenu(null);
+      if (
+        !profileMenuRef.current?.contains(el) &&
+        !profileButtonRef.current?.contains(el)
+      ) {
+        setShowProfileMenu(false);
+      }
 
       const inHeaderToolbar =
         roomHeaderActionsRef.current?.contains(el) ||
@@ -512,6 +1117,12 @@ export default function ChatPage() {
         setContextMenu(null);
         setRoomContextMenu(null);
         setShowRoomMenu(false);
+        setShowProfileMenu(false);
+        // Быстрый выход в главное меню (без выбранного чата)
+        if (selectedRoomIdRef.current != null) {
+          setSelectedRoom(null);
+          setMsgList([]);
+        }
       }
     };
 
@@ -615,11 +1226,30 @@ export default function ChatPage() {
     }
   };
 
-  const filteredRooms = myRooms.filter((room) =>
-    getRoomSidebarTitle(room).toLowerCase().includes(searchInput.toLowerCase())
-  );
+  const filteredRooms = [...myRooms]
+    .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
+    .filter((room) => {
+      const query = searchInput.toLowerCase().trim();
+      if (!query) return true;
+      const title = getRoomSidebarTitle(room).toLowerCase();
+      const preview = getRoomPreview(room).toLowerCase();
+      return title.includes(query) || preview.includes(query);
+    });
 
   const isOwner = selectedRoom && isMe(selectedRoom.created_by);
+  const profileLabel = profileNickname || (userId != null ? `User #${userId}` : 'Профиль');
+  const profileUsernameLabel = profileUsername ? `@${profileUsername}` : '@unknown';
+  const profileInitial = profileLabel[0]?.toUpperCase() || 'U';
+
+  const copyProfileUsername = async () => {
+    if (!profileUsername) return;
+    try {
+      await navigator.clipboard.writeText(`@${profileUsername}`);
+      showToast('Username скопирован', 'success');
+    } catch {
+      showToast('Не удалось скопировать username', 'error');
+    }
+  };
 
   return (
     <div className="chat-page">
@@ -644,7 +1274,41 @@ export default function ChatPage() {
       {/* Средний сайдбар */}
       <div className="middle-sidebar">
         <div className="sidebar-header">
-          <h2>MsgHub</h2>
+          <button
+            ref={profileButtonRef}
+            className="profile-widget"
+            onClick={() => setShowProfileMenu((v) => !v)}
+            title="Профиль и настройки"
+          >
+            <span className="profile-widget-avatar">{profileInitial}</span>
+            <span className="profile-widget-meta">
+              <span className="profile-widget-name">{profileLabel}</span>
+              <button
+                type="button"
+                className="profile-widget-subname profile-username-copy"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void copyProfileUsername();
+                }}
+                title="Скопировать @username"
+              >
+                {profileUsernameLabel}
+              </button>
+            </span>
+          </button>
+          {showProfileMenu && (
+            <div className="profile-menu" ref={profileMenuRef}>
+              <button onClick={() => { setActiveMenu('settings'); setShowProfileMenu(false); }}>
+                ⚙️ Профиль и настройки
+              </button>
+              <button onClick={() => { setActiveMenu('settings'); setShowProfileMenu(false); }}>
+                🖥️ Настройки приложения (скоро)
+              </button>
+              <button className="danger" onClick={logout}>
+                ⎋ Выйти
+              </button>
+            </div>
+          )}
         </div>
         <div className="search-box">
           <input type="text" placeholder="Поиск..." value={searchInput} onChange={(e) => setSearchInput(e.target.value)} className="search-input" />
@@ -659,6 +1323,10 @@ export default function ChatPage() {
             <div className="room-list">
               {filteredRooms.map((room) => {
                 const unread = unreadCounts[room.id] || 0;
+                const roomTitle = room.type === 'direct' && room.partner_id != null
+                  ? (getAlias(room.partner_id) || getRoomSidebarTitle(room))
+                  : getRoomSidebarTitle(room);
+                const roomPreview = getRoomPreview(room);
                 return (
                 <div
                   key={room.id}
@@ -676,7 +1344,10 @@ export default function ChatPage() {
                   }}
                 >
                   <span className="room-icon">{room.type === 'direct' ? '👤' : '#'}</span>
-                  <span className="room-name">{getRoomSidebarTitle(room)}</span>
+                  <div className="room-text">
+                    <span className="room-name">{roomTitle}</span>
+                    <span className="room-preview">{roomPreview}</span>
+                  </div>
                   {unread > 0 && <span className="unread-badge">{unread > 99 ? '99+' : unread}</span>}
                 </div>
               )})}
@@ -745,7 +1416,7 @@ export default function ChatPage() {
         {activeMenu === 'settings' && (
           <div className="content-panel settings-panel">
             <div className="settings-section">
-              <h4>Аккаунт</h4>
+              <h4>Профиль</h4>
               <div className="setting-item">
                 <span className="setting-label">ID пользователя</span>
                 <span className="setting-value">#{userId}</span>
@@ -757,6 +1428,28 @@ export default function ChatPage() {
               <div className="setting-item">
                 <span className="setting-label">Друзей</span>
                 <span className="setting-value">{friendList.length}</span>
+              </div>
+              <div className="setting-item">
+                <span className="setting-label">E2E локальный ключ</span>
+                <span className="setting-value">{hasE2EKey ? 'Есть' : 'Нет'}</span>
+              </div>
+              <button className="btn-secondary" onClick={rotateLocalE2EKey}>
+                Обновить локальный E2E-ключ
+              </button>
+            </div>
+            <div className="settings-section app-settings-placeholder">
+              <h4>Настройки приложения (задел под Electron)</h4>
+              <div className="setting-item">
+                <span className="setting-label">Тема интерфейса</span>
+                <span className="setting-value">Скоро</span>
+              </div>
+              <div className="setting-item">
+                <span className="setting-label">Горячие клавиши</span>
+                <span className="setting-value">Скоро</span>
+              </div>
+              <div className="setting-item">
+                <span className="setting-label">Уведомления</span>
+                <span className="setting-value">Скоро</span>
               </div>
             </div>
             <button className="logout-btn-full" onClick={logout}>
@@ -795,11 +1488,36 @@ export default function ChatPage() {
               </div>
             </div>
 
+            {selectedRoom.type === 'direct' && selectedRoom.partner_id != null && (
+              <div style={{ padding: '10px 16px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <input
+                    type="text"
+                    placeholder="Локальный псевдоним для пользователя"
+                    value={aliasDraft}
+                    onChange={(e) => setAliasDraft(e.target.value)}
+                    style={{ flex: 1 }}
+                  />
+                  <button className="btn-secondary" onClick={saveAliasForCurrentDirect}>
+                    Сохранить
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Меню управления комнатой */}
             {showRoomMenu && (
               <div className="room-menu" ref={roomHeaderDropdownRef}>
                 {selectedRoom.type === 'group' && (
                   <>
+                    {isOwner && (
+                      <button className="room-menu-item" onClick={async () => {
+                        await rotateGroupE2EKey();
+                        setShowRoomMenu(false);
+                      }}>
+                        🔐 Ротация E2E-ключа группы
+                      </button>
+                    )}
                     <button className="room-menu-item danger" onClick={async () => {
                       await leaveRoom();
                       setShowRoomMenu(false);
@@ -871,7 +1589,11 @@ export default function ChatPage() {
                   <div className="message-avatar">👤</div>
                   <div className="message">
                     <div className="msg-header">
-                      <span className="msg-author">{isMe(msg.sender_id) ? 'Вы' : (msg.sender_nickname || `User #${msg.sender_id}`)}</span>
+                      <span className="msg-author">
+                        {isMe(msg.sender_id)
+                          ? 'Вы'
+                          : preferAlias(Number(msg.sender_id), msg.sender_nickname || `User #${msg.sender_id}`)}
+                      </span>
                       <span className="msg-time">
                         {new Date(msg.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}
                         {msg.is_edited && <span className="edited-badge"> (ред.)</span>}

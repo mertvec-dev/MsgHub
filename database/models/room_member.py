@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from sqlalchemy import UniqueConstraint
 
-class MembershipStatus(str, Enum):
+class MembershipStatus(str, Enum): 
     OWNER = "owner" # created_by в таблице Room
     ADMIN = "admin" # назначается владельцем комнаты
     MEMBER = "member" # обычный участник комнаты
@@ -29,4 +29,4 @@ class RoomMember(SQLModel, table=True):
     joined_at: datetime = Field(default_factory=datetime.utcnow)
     status: MembershipStatus = Field(default=MembershipStatus.MEMBER, index=True)
 
-    __table_args__ = (UniqueConstraint("room_id", "user_id", name="unique_room_user"),)
+    __table_args__ = (UniqueConstraint("room_id", "user_id", name="unique_room_user"),) # для чтобы не было двух участников с одним и тем же room_id и user_id

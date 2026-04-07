@@ -1,16 +1,19 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import type { ReactNode } from 'react';
-import { auth } from '../services/api';
+import { auth, setAccessToken } from '../services/api';
 
 interface AuthContextType {
   userId: number | null;
   token: string | null;
+  profileNickname: string | null;
+  profileUsername: string | null;
   login: (username: string, password: string) => Promise<void>;
   register: (nickname: string, username: string, password: string) => Promise<void>;
   logout: () => void;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
+const PROFILE_CACHE_KEY = 'msghub-profile-v1';
 
 /**
  * Парсит userId из JWT токена.
@@ -42,34 +45,54 @@ function userIdFromAuthPayload(data: { access_token: string; user_id?: number })
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  // Инициализируем из localStorage — безопасно
-  const storedToken = localStorage.getItem('access_token');
-  const [token, setToken] = useState<string | null>(storedToken);
-  const [userId, setUserId] = useState<number | null>(() => parseUserId(storedToken));
+  const [token, setToken] = useState<string | null>(null);
+  const [userId, setUserId] = useState<number | null>(null);
+  const [profileNickname, setProfileNickname] = useState<string | null>(null);
+  const [profileUsername, setProfileUsername] = useState<string | null>(null);
 
-  // Если при загрузке токен оказался битым — чистим
-  useEffect(() => {
-    if (token && !userId) {
-      console.warn('⚠️ Битый токен в localStorage — очищаю');
-      localStorage.removeItem('access_token');
-      localStorage.removeItem('refresh_token');
-      setToken(null);
+  const saveProfile = useCallback((nickname: string | null, username: string | null) => {
+    setProfileNickname(nickname);
+    setProfileUsername(username);
+    try {
+      if (!nickname && !username) {
+        localStorage.removeItem(PROFILE_CACHE_KEY);
+      } else {
+        localStorage.setItem(PROFILE_CACHE_KEY, JSON.stringify({ nickname, username }));
+      }
+    } catch {
+      // ignore storage errors
     }
-  }, []); // только при монтировании
+  }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(PROFILE_CACHE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as { nickname?: string; username?: string };
+      if (parsed.nickname) setProfileNickname(parsed.nickname);
+      if (parsed.username) setProfileUsername(parsed.username);
+    } catch {
+      // ignore parse errors
+    }
+  }, []);
 
   const logout = useCallback(() => {
-    localStorage.removeItem('access_token');
-    localStorage.removeItem('refresh_token');
+    auth.logout().catch(() => {
+      // Даже если сервер недоступен, локально выходим.
+    });
+    setAccessToken(null);
     setToken(null);
     setUserId(null);
-  }, []);
+    saveProfile(null, null);
+  }, [saveProfile]);
 
   // Синхронизация после авто-refresh в axios (api.ts)
   useEffect(() => {
     const onTokensRefreshed = (e: Event) => {
-      const ce = e as CustomEvent<{ access_token: string; refresh_token: string; user_id?: number }>;
+      const ce = e as CustomEvent<{ access_token: string; user_id?: number }>;
       const d = ce.detail;
       if (!d?.access_token) return;
+      setAccessToken(d.access_token);
       setToken(d.access_token);
       setUserId(userIdFromAuthPayload(d));
     };
@@ -82,24 +105,35 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, [logout]);
 
+  // Восстанавливаем сессию на старте через refresh-cookie.
+  useEffect(() => {
+    auth.refresh().catch(() => {
+      setAccessToken(null);
+      setToken(null);
+      setUserId(null);
+    });
+  }, []);
+
   const login = useCallback(async (username: string, password: string) => {
     const { data } = await auth.login(username, password);
-    localStorage.setItem('access_token', data.access_token);
-    localStorage.setItem('refresh_token', data.refresh_token);
+    setAccessToken(data.access_token);
     setToken(data.access_token);
     setUserId(userIdFromAuthPayload(data));
-  }, []);
+    // Пока отдельного /me нет, берём username из формы входа.
+    // Никнейм пытаемся сохранить из предыдущего локального профиля.
+    saveProfile(profileNickname || username, username);
+  }, [profileNickname, saveProfile]);
 
   const register = useCallback(async (nickname: string, username: string, password: string) => {
     const { data } = await auth.register(nickname, username, password);
-    localStorage.setItem('access_token', data.access_token);
-    localStorage.setItem('refresh_token', data.refresh_token);
+    setAccessToken(data.access_token);
     setToken(data.access_token);
     setUserId(userIdFromAuthPayload(data));
-  }, []);
+    saveProfile(nickname, username);
+  }, [saveProfile]);
 
   return (
-    <AuthContext.Provider value={{ userId, token, login, register, logout }}>
+    <AuthContext.Provider value={{ userId, token, profileNickname, profileUsername, login, register, logout }}>
       {children}
     </AuthContext.Provider>
   );

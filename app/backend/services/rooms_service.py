@@ -13,6 +13,7 @@
 # ИМПОРТЫ
 # ============================================================================
 from typing import List, Dict, Any
+from datetime import datetime
 
 from sqlmodel import select
 from sqlalchemy import text
@@ -23,6 +24,8 @@ from database.models.room_member import RoomMember, MembershipStatus
 from database.models.friendships import Friendship, FriendshipStatus
 from database.models.messages import Message
 from database.models.users import User
+from database.models.room_key_envelopes import RoomKeyEnvelope
+from app.backend.schemas.e2e import RoomKeyEnvelopeUpsertRequest
 
 
 # ============================================================================
@@ -538,6 +541,151 @@ class RoomService:
         member = res.scalars().first()
         return member and member.status in (MembershipStatus.ADMIN, MembershipStatus.OWNER)
 
+    # ==========================================================================
+    # ОБНОВЛЕНИЕ КОНВЕРТА С ПУБЛИЧНЫМ КЛЮЧОМ E2E ДЛЯ ШИФРОВАНИЯ СООБЩЕНИЙ В КОМНАТЕ
+    # ==========================================================================
 
+    async def upsert_room_key(self, room_id: int, user_id: int, request: RoomKeyEnvelopeUpsertRequest) -> dict:
+        """
+        Пакетно сохраняет/обновляет конверты room key для указанной версии ключа.
+        """
+        async for session in db_engine.get_async_session():
+            # 1) Текущий пользователь должен быть участником комнаты.
+            res = await session.execute(
+                select(RoomMember).where(
+                    RoomMember.room_id == room_id,
+                    RoomMember.user_id == user_id,
+                    RoomMember.status != MembershipStatus.BANNED,
+                    )
+                )
+            member = res.scalars().first()
+            if not member:
+                raise ValueError("Вы не являетесь участником комнаты")
+
+            # 2) Комната должна существовать.
+            room_res = await session.execute(select(Room).where(Room.id == room_id))
+            room = room_res.scalars().first()
+            if not room:
+                raise ValueError("Комната не найдена")
+
+            # 3) Версия ключа не может быть старее/новее текущей (ротация отдельным шагом).
+            if request.key_version < room.current_key_version:
+                raise ValueError("Указана устаревшая версия ключа")
+            if request.key_version > room.current_key_version:
+                raise ValueError("Сначала выполните ротацию ключа комнаты")
+
+            upserted = 0
+
+            # 4) Upsert для каждого конверта из запроса.
+            for item in request.envelopes:
+                target_member_res = await session.execute(
+                    select(RoomMember).where(
+                        RoomMember.room_id == room_id,
+                        RoomMember.user_id == item.user_id,
+                        RoomMember.status != MembershipStatus.BANNED,
+                    )
+                )
+                target_member = target_member_res.scalars().first()
+                if not target_member:
+                    raise ValueError(f"Пользователь {item.user_id} не является участником комнаты")
+
+                env_res = await session.execute(
+                    select(RoomKeyEnvelope).where(
+                        RoomKeyEnvelope.room_id == room_id,
+                        RoomKeyEnvelope.user_id == item.user_id,
+                        RoomKeyEnvelope.key_version == request.key_version,
+                    )
+                )
+                envelope = env_res.scalars().first()
+
+                if envelope:
+                    envelope.encrypted_key = item.encrypted_key
+                    envelope.algorithm = item.algorithm
+                    envelope.updated_at = datetime.utcnow()
+                else:
+                    envelope = RoomKeyEnvelope(
+                        room_id=room_id,
+                        user_id=item.user_id,
+                        key_version=request.key_version,
+                        encrypted_key=item.encrypted_key,
+                        algorithm=item.algorithm,
+                    )
+                    session.add(envelope)
+                upserted += 1
+
+            await session.commit()
+            return {
+                "room_id": room_id,
+                "key_version": request.key_version,
+                "upserted": upserted,
+            }
+
+    async def get_room_key(self, room_id: int, user_id: int) -> dict:
+        """
+        Получает конверт с публичным ключом E2E для шифрования сообщений в комнате.
+        """
+        async for session in db_engine.get_async_session():
+            # 1) Текущий пользователь должен быть участником комнаты.
+            res = await session.execute(
+                select(RoomMember).where(
+                    RoomMember.room_id == room_id,
+                    RoomMember.user_id == user_id,
+                    RoomMember.status != MembershipStatus.BANNED,
+                    )
+                )
+            member = res.scalars().first()
+            if not member:
+                raise ValueError("Вы не являетесь участником комнаты")
+
+            # 2) Комната должна существовать.
+            room_res = await session.execute(select(Room).where(Room.id == room_id))
+            room = room_res.scalars().first()
+            if not room:
+                raise ValueError("Комната не найдена")
+            
+            env_res = await session.execute(
+                    select(RoomKeyEnvelope).where(
+                        RoomKeyEnvelope.room_id == room_id,
+                        RoomKeyEnvelope.user_id == user_id,
+                        RoomKeyEnvelope.key_version == room.current_key_version,
+                    )
+                )
+            envelope = env_res.scalars().first()
+            if not envelope:
+                raise ValueError("Конверт не найден")
+            return {
+                "room_id": room_id,
+                "user_id": user_id,
+                "key_version": room.current_key_version,
+                "encrypted_key": envelope.encrypted_key,
+                "algorithm": envelope.algorithm,
+            }
+
+    async def rotate_room_key(self, room_id: int, user_id: int) -> dict:
+        """
+        Вращает (меняет версию) ключ в конверте с публичным ключом E2E для шифрования сообщений в комнате.
+        """
+        async for session in db_engine.get_async_session():
+            # 1) Пользователь должен иметь права администратора или владельца комнаты.
+            if not await self._check_rights(user_id, room_id, session):
+                raise ValueError("Прав недостаточно")
+            
+            # 2) Комната должна существовать.
+            room_res = await session.execute(select(Room).where(Room.id == room_id))
+            room = room_res.scalars().first()
+            if not room:
+                raise ValueError("Комната не найдена")
+            
+            # 3) Вращаем ключ.
+            room_id_value = room.id
+            new_key_version = room.current_key_version + 1
+            room.current_key_version = new_key_version
+            session.add(room)
+            await session.commit()
+            # Сервис возвращает plain dict; Pydantic-обертка создается в роутере.
+            return {
+                "room_id": room_id_value,
+                "current_key_version": new_key_version,
+            }
 # Глобальный экземпляр
 room_service = RoomService()

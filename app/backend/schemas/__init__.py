@@ -2,7 +2,6 @@ from app.backend.schemas.auth import (
     RegisterRequest,
     LoginRequest,
     TokenResponse,
-    RefreshRequest,
     SessionInfo,
     SessionListResponse,
     LogoutResponse,
@@ -35,8 +34,18 @@ from app.backend.schemas.rooms import (
 
 from app.backend.schemas.messages import (
     MessageCreate,
+    MessageEditRequest,
     MessageResponse,
     MessagesList,
+)
+
+from app.backend.schemas.e2e import (
+    E2EKeyRequest,
+    PublicKeyResponse,
+    RoomKeyEnvelopeItem,
+    RoomKeyEnvelopeUpsertRequest,
+    RoomKeyEnvelopeResponse,
+    RoomKeyRotateResponse,
 )
 
 __all__ = [
@@ -44,7 +53,6 @@ __all__ = [
     "RegisterRequest",
     "LoginRequest",
     "TokenResponse",
-    "RefreshRequest",
     "SessionInfo",
     "SessionListResponse",
     "LogoutResponse",
@@ -73,6 +81,15 @@ __all__ = [
     
     # Messages
     "MessageCreate",
+    "MessageEditRequest",
     "MessageResponse",
     "MessagesList",
+
+    # E2E
+    "E2EKeyRequest",
+    "PublicKeyResponse",
+    "RoomKeyEnvelopeItem",
+    "RoomKeyEnvelopeUpsertRequest",
+    "RoomKeyEnvelopeResponse",
+    "RoomKeyRotateResponse",
 ]

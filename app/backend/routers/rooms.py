@@ -31,6 +31,11 @@ from app.backend.services import pubsub
 from database.models.rooms import RoomType
 from database.models.room_member import RoomMember
 from database.models.users import User
+from app.backend.schemas.e2e import (
+    RoomKeyEnvelopeUpsertRequest,
+    RoomKeyEnvelopeResponse,
+    RoomKeyRotateResponse,
+)
 
 # Асинхронная сессия БД
 from database.engine import db_engine
@@ -317,3 +322,74 @@ async def delete_room_self(room_id: int, user_id: int = Depends(get_current_user
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
+
+# ============================================================================
+# ЭНДПОИНТЫ — Действия с публичными ключами E2E (сквозное шифрование сообщений)
+# ============================================================================
+@router.post(
+    "/{room_id}/keys/upsert",
+    summary="Сохраняет конверты room-key для версии",
+    description="Пакетно upsert конвертов (encrypted room key) для участников комнаты"
+)
+async def upsert_room_key(
+    room_id: int,
+    payload: RoomKeyEnvelopeUpsertRequest,
+    user_id: int = Depends(get_current_user),
+):
+    """
+    Загружает на сервер набор конвертов для room key.
+
+    Важно:
+    - сервер НЕ видит исходный room key, только encrypted_key;
+    - version control идет через key_version;
+    - каждый элемент envelopes адресован конкретному user_id.
+    """
+    try:
+        return await room_service.upsert_room_key(room_id, user_id, payload)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.get(
+    "/{room_id}/keys/my",
+    response_model=RoomKeyEnvelopeResponse,
+    summary="Получить мой актуальный конверт ключа",
+    description="Возвращает encrypted room key для текущего пользователя и текущей версии комнаты",
+)
+async def get_my_room_key(room_id: int, user_id: int = Depends(get_current_user)):
+    """
+    Возвращает только КОНВЕРТ текущего пользователя (my key envelope).
+
+    Это безопаснее, чем отдавать конверты других участников:
+    каждый клиент получает только свой encrypted_key и расшифровывает локально.
+    """
+    try:
+        data = await room_service.get_room_key(room_id, user_id)
+        return RoomKeyEnvelopeResponse(**data)
+    except ValueError as e:
+        detail = str(e)
+        status_code = status.HTTP_404_NOT_FOUND if "не найден" in detail.lower() else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=detail)
+
+
+@router.post(
+    "/{room_id}/keys/rotate",
+    response_model=RoomKeyRotateResponse,
+    summary="Ротация версии room key",
+    description="Повышает current_key_version комнаты на 1 (только admin/owner)",
+)
+async def rotate_room_key(room_id: int, user_id: int = Depends(get_current_user)):
+    """
+    Ротация не меняет старые сообщения — она открывает НОВУЮ версию ключа.
+    Дальше клиент должен загрузить новые конверты через /keys/upsert.
+    """
+    try:
+        data = await room_service.rotate_room_key(room_id, user_id)
+        return RoomKeyRotateResponse(**data)
+    except ValueError as e:
+        detail = str(e)
+        status_code = status.HTTP_403_FORBIDDEN if "прав" in detail.lower() else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=detail)

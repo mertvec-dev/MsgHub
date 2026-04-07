@@ -87,6 +87,8 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30    # Время жизни access-токена
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7       # Время жизни refresh-токена
     SESSION_EXPIRE_DAYS: int = 7             # Время жизни сессии в БД
+    AUTH_COOKIE_SECURE: bool = False         # True в проде под HTTPS
+    AUTH_COOKIE_SAMESITE: str = "lax"        # lax/strict/none
 
     # ─── Сервер ───
     HOST: str = "0.0.0.0"         # Адрес прослушивания

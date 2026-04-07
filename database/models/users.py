@@ -16,6 +16,7 @@ class User(SQLModel, table=True):
         **status_message**: Статус пользователя (опционально)
         **is_admin**: Является ли администратором
         **created_at**: Дата по UTC, создается СУБД при создании поля
+        **updated_at**: Дата по UTC, обновляется СУБД при обновлении поля
     """
     __tablename__ = "users"
     
@@ -31,7 +32,7 @@ class User(SQLModel, table=True):
     avatar_url: Optional[str] = Field(default=None)
     status_message: Optional[str] = Field(default=None)
     
-    is_admin: bool = Field(default=False)
+    is_admin: bool = Field(default=False) # TODO: Сделать админку и функционал для админов
     
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)

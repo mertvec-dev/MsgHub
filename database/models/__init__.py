@@ -5,6 +5,9 @@ from database.models.rooms import Room
 from database.models.room_member import RoomMember
 from database.models.messages import Message
 from database.models.message_reads import MessageRead
+from database.models.users_public_key import UserPublicKey
+from database.models.room_key_envelopes import RoomKeyEnvelope
+from database.models.devices import Device
 
 __all__ = [
     "User",
@@ -13,5 +16,8 @@ __all__ = [
     "Room",
     "RoomMember",
     "Message",
-    "MessageRead",
+    "MessageRead",  
+    "UserPublicKey",
+    "RoomKeyEnvelope",
+    "Device",
 ]

@@ -8,36 +8,63 @@ services:
       POSTGRES_DB: ${DB_NAME}
     volumes: # Постоянное хранилище
       - postgres_data:/var/lib/postgresql/data
-    ports: # Проброс портов
-      - "5432:5432"
     networks:
-      - msghub_network
-    restart: unless-stopped
+      - msghub_network 
+    healthcheck: # Проверка работоспособности БД
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${DB_NAME}"] # Команда для проверки работоспособности БД
+      interval: 10s # Интервал между проверками
+      timeout: 5s # Таймаут проверки
+      retries: 5 # Количество попыток
+      start_period: 10s # Задержка перед первой проверкой
+    restart: unless-stopped # Перезапуск контейнера при сбое
 
   redis: # Redis
     image: redis:7-alpine
     command: redis-server --appendonly yes
     container_name: msghub_redis
-    ports:
-      - "6379:6379"
     networks:
       - msghub_network
+    healthcheck: # Проверка работоспособности Redis
+      test: ["CMD", "redis-cli", "ping"] # Команда для проверки работоспособности Redis
+      interval: 10s # Интервал между проверками
+      timeout: 5s # Таймаут проверки
+      retries: 5 # Количество попыток
+      start_period: 5s # Задержка перед первой проверкой
     restart: unless-stopped
     volumes:
-      - redis_data:/data
+      - redis_data:/data # Объем для хранения данных Redis
   
   backend: # Бэкенд
     build: # Будем собирать образ из DockerFile
-      context: .
+      context: . # Контекст сборки (корневая директория проекта)
       dockerfile: Dockerfile
     container_name: msghub_backend
     env_file:
       - .env
-    ports:
-      - "8000:8000"
+    expose: # Порты будут доступны только внутри контейнера
+      - "8000"
     depends_on:
-      - db
-      - redis
+      db: # Зависимость от БД
+        condition: service_healthy # Проверка работоспособности БД
+      redis: # Зависимость от Redis
+        condition: service_healthy # Проверка работоспособности Redis
+    networks: # Сеть для контейнера
+      - msghub_network
+    restart: unless-stopped # Перезапуск контейнера при сбое
+  
+  nginx: # Nginx
+    image: nginx:latest
+    container_name: msghub_nginx
+    ports:
+      - "80:80"
+      # TODO: раскомментировать порт при отправке на ВМ: - "443:443"
+    volumes:
+      - ./nginx.conf/nginx.conf:/etc/nginx/nginx.conf:ro
+      # - ./app/frontend/dist:/usr/share/nginx/html:ro # Статика фронтенда
+      # - ./infrastructure/nginx/certs:/etc/nginx/certs:ro # Сертификаты
+    depends_on:
+      backend:
+        condition: service_started # Проверка работоспособности бэкенда
     networks:
       - msghub_network
     restart: unless-stopped
@@ -59,6 +86,6 @@ volumes:
   postgres_data:
   redis_data:
 
-networks:
-  msghub_network:
-    driver: bridge
+networks: 
+  msghub_network: 
+    driver: bridge # Сеть для контейнера
