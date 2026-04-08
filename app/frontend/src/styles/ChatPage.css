@@ -627,6 +627,37 @@
   margin-bottom: 6px;
 }
 
+.profile-input-wrap {
+  padding: 0;
+  background: transparent;
+}
+
+.profile-input {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid #2a315d;
+  background: linear-gradient(180deg, #171d3d 0%, #141a35 100%);
+  color: #e9ecff;
+  font-size: 15px;
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+}
+
+.profile-input::placeholder {
+  color: #9aa3cc;
+}
+
+.profile-input:hover {
+  border-color: #394486;
+}
+
+.profile-input:focus {
+  border-color: #6c63ff;
+  box-shadow: 0 0 0 3px rgba(108, 99, 255, 0.2);
+  background: #171f42;
+}
+
 .setting-label {
   color: #888;
   font-size: 13px;

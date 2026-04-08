@@ -62,6 +62,8 @@ interface PendingOutboxItem {
   attempts: number;
 }
 
+const MAX_MESSAGE_CHARS = 1800;
+
 /** API/WS могут отдавать id числом или строкой — строгое === ломало удаление и обновление списка */
 function sameId(a: unknown, b: unknown): boolean {
   if (a == null || b == null) return false;
@@ -1016,6 +1018,10 @@ export default function ChatPage() {
   }, [activePeerPublicKey, directHandshakeReady, groupHandshakeReady]);
 
   const queueMessageToOutbox = useCallback((room: Room, text: string) => {
+    if (text.length > MAX_MESSAGE_CHARS) {
+      showToast(`Сообщение слишком длинное (максимум ${MAX_MESSAGE_CHARS} символов)`, 'error');
+      return;
+    }
     const localId = -Date.now();
     const nowIso = new Date().toISOString();
     setPendingOutbox((prev) => [
@@ -1053,7 +1059,7 @@ export default function ChatPage() {
       )
     );
     setPreviewCache(room.id, text);
-  }, [setPreviewCache, userId]);
+  }, [setPreviewCache, showToast, userId]);
 
   const sendEncryptedText = useCallback(async (room: Room, text: string, localId?: number): Promise<boolean> => {
     const isDirect = room.type === 'direct';
@@ -1112,6 +1118,10 @@ export default function ChatPage() {
     if (!selectedRoom || !input.trim() || isSending || sendCooldown) return;
     const room = selectedRoom;
     const text = input.trim();
+    if (text.length > MAX_MESSAGE_CHARS) {
+      showToast(`Сообщение слишком длинное (максимум ${MAX_MESSAGE_CHARS} символов)`, 'error');
+      return;
+    }
     setInput('');
     if (!isRoomReadyToSend(room)) {
       queueMessageToOutbox(room, text);
@@ -1157,6 +1167,13 @@ export default function ChatPage() {
       }
     })();
   }, [selectedRoom?.id, isRoomReadyToSend, sendEncryptedText, pendingOutbox]);
+
+  useEffect(() => {
+    const tooLong = pendingOutbox.filter((p) => p.text.length > MAX_MESSAGE_CHARS);
+    if (!tooLong.length) return;
+    setPendingOutbox((prev) => prev.filter((p) => p.text.length <= MAX_MESSAGE_CHARS));
+    showToast(`Удалены слишком длинные сообщения из буфера (${tooLong.length})`, 'error');
+  }, [pendingOutbox, showToast]);
 
   useEffect(() => {
     if (!selectedRoom) return;
@@ -1702,29 +1719,33 @@ export default function ChatPage() {
           <div className="content-panel settings-panel">
             <div className="settings-section">
               <h4>Профиль</h4>
-              <div className="setting-item">
+              <div className="setting-item profile-input-wrap">
                 <input
+                  className="profile-input"
                   placeholder="Никнейм"
                   value={profileDraft.nickname}
                   onChange={(e) => setProfileDraft((p) => ({ ...p, nickname: e.target.value }))}
                 />
               </div>
-              <div className="setting-item">
+              <div className="setting-item profile-input-wrap">
                 <input
+                  className="profile-input"
                   placeholder="Email"
                   value={profileDraft.email}
                   onChange={(e) => setProfileDraft((p) => ({ ...p, email: e.target.value }))}
                 />
               </div>
-              <div className="setting-item">
+              <div className="setting-item profile-input-wrap">
                 <input
+                  className="profile-input"
                   placeholder="Статус"
                   value={profileDraft.status_message}
                   onChange={(e) => setProfileDraft((p) => ({ ...p, status_message: e.target.value }))}
                 />
               </div>
-              <div className="setting-item">
+              <div className="setting-item profile-input-wrap">
                 <input
+                  className="profile-input"
                   placeholder="Тег профиля"
                   value={profileDraft.profile_tag}
                   onChange={(e) => setProfileDraft((p) => ({ ...p, profile_tag: e.target.value }))}
@@ -1926,14 +1947,10 @@ export default function ChatPage() {
                     }}>
                       ❌ Удалить чат
                     </button>
-                    <button className="room-menu-item danger" onClick={async () => {
-                      const other = roomMembers.find((m) => !isMe(m.id));
-                      if (other) {
-                        await rooms.ban(selectedRoom.id, other.id);
-                        showToast('Пользователь заблокирован', 'success');
-                        setShowRoomMenu(false);
-                      }
-                    }}>
+                    <button
+                      className="room-menu-item danger"
+                      onClick={() => void blockPartnerAndRemoveChat(selectedRoom)}
+                    >
                       🚫 Заблокировать
                     </button>
                   </>
@@ -2081,6 +2098,7 @@ export default function ChatPage() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && sendMsg()}
+                maxLength={MAX_MESSAGE_CHARS}
                 disabled={
                   (selectedRoom.type === 'direct' && !directHandshakeReady) ||
                   (selectedRoom.type === 'group' && !groupHandshakeReady)
