@@ -26,6 +26,7 @@ class Device(SQLModel, table=True):
     last_active_at: datetime = Field(default_factory=datetime.utcnow)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-    # public_key: str = Field() # публичный ключ устройства для шифрования TODO: раскомментировать после реализации multi-device и включить миграцию
-
+    public_key: Optional[str] = Field(default=None) # публичный ключ устройства для шифрования
+    key_algorithm: str = Field(default="p256-ecdh-v1") # алгоритм ключа для шифрования
+    key_updated_at: Optional[datetime] = Field(default=None) # дата последнего обновления ключа
     __table_args__ = (UniqueConstraint("user_id", "device_id", name="unique_user_device"),) # чтобы не было двух устройств для одного и того же пользователя с одним и тем же device_id

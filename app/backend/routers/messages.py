@@ -171,6 +171,7 @@ async def send_message(
             content=payload.content,
             nonce=payload.nonce,
             key_version=payload.key_version,
+            sender_device_id=payload.sender_device_id,
         )
 
         # Получаем никнейм отправителя для WebSocket (быстрый запрос)
@@ -185,6 +186,7 @@ async def send_message(
             "room_id": msg.room_id,
             "sender_id": user_id,
             "sender_nickname": sender_nickname,
+            "sender_device_id": msg.sender_device_id,
             "content": msg.content,
             "nonce": msg.nonce,
             "key_version": msg.key_version,
@@ -206,6 +208,7 @@ async def send_message(
             "content": msg.content,
             "nonce": msg.nonce,
             "key_version": msg.key_version,
+            "sender_device_id": msg.sender_device_id,
             "timestamp": msg.created_at.isoformat() if hasattr(msg.created_at, 'isoformat') else str(msg.created_at),
         }
     except ValueError as e:

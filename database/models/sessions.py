@@ -21,6 +21,7 @@ class Session(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="users.id")
     refresh_token_hash: str = Field(index=True)
+    device_id: Optional[str] = Field(default=None, index=True)
     
     device_info: Optional[str] = Field(default=None)
     ip_address: Optional[str] = Field(default=None)

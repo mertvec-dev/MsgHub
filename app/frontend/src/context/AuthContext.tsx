@@ -7,6 +7,7 @@ interface AuthContextType {
   token: string | null;
   profileNickname: string | null;
   profileUsername: string | null;
+  isAdmin: boolean;
   login: (username: string, password: string) => Promise<void>;
   register: (nickname: string, username: string, password: string) => Promise<void>;
   logout: () => void;
@@ -49,6 +50,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [userId, setUserId] = useState<number | null>(null);
   const [profileNickname, setProfileNickname] = useState<string | null>(null);
   const [profileUsername, setProfileUsername] = useState<string | null>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
 
   const saveProfile = useCallback((nickname: string | null, username: string | null) => {
     setProfileNickname(nickname);
@@ -83,6 +85,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setAccessToken(null);
     setToken(null);
     setUserId(null);
+    setIsAdmin(false);
     saveProfile(null, null);
   }, [saveProfile]);
 
@@ -119,21 +122,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setAccessToken(data.access_token);
     setToken(data.access_token);
     setUserId(userIdFromAuthPayload(data));
-    // Пока отдельного /me нет, берём username из формы входа.
-    // Никнейм пытаемся сохранить из предыдущего локального профиля.
-    saveProfile(profileNickname || username, username);
-  }, [profileNickname, saveProfile]);
+    const me = await auth.getMe();
+    saveProfile(me.data.nickname, me.data.username);
+    setIsAdmin(Boolean(me.data.is_admin));
+  }, [saveProfile]);
 
   const register = useCallback(async (nickname: string, username: string, password: string) => {
     const { data } = await auth.register(nickname, username, password);
     setAccessToken(data.access_token);
     setToken(data.access_token);
     setUserId(userIdFromAuthPayload(data));
-    saveProfile(nickname, username);
+    const me = await auth.getMe();
+    saveProfile(me.data.nickname, me.data.username);
+    setIsAdmin(Boolean(me.data.is_admin));
   }, [saveProfile]);
 
   return (
-    <AuthContext.Provider value={{ userId, token, profileNickname, profileUsername, login, register, logout }}>
+    <AuthContext.Provider value={{ userId, token, profileNickname, profileUsername, isAdmin, login, register, logout }}>
       {children}
     </AuthContext.Provider>
   );

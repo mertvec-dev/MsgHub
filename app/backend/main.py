@@ -213,12 +213,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         if 'user_id' in locals():
-            manager.disconnect(user_id)
+            manager.disconnect_socket(user_id, websocket)
             logger.info(f"WebSocket отключился: user_id={user_id}")
     except Exception as e:
         logger.error(f"WebSocket ошибка: {e}")
         if 'user_id' in locals():
-            manager.disconnect(user_id)
+            manager.disconnect_socket(user_id, websocket)
 
 
 # ============================================================================

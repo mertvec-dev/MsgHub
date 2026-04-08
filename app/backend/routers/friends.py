@@ -18,6 +18,8 @@ from app.backend.schemas.friends import FriendRequest
 
 # Сервис друзей — бизнес-логика
 from app.backend.services.friends_service import friends_service
+from app.backend.services.rooms_service import room_service
+from app.backend.services import pubsub
 
 # Получение user_id из JWT-токена
 from app.backend.utils.jwt_utils import get_current_user
@@ -77,6 +79,34 @@ async def accept_request(request_id: int, user_id: int = Depends(get_current_use
     """
     try:
         await friends_service.accept_request(user_id, request_id)
+        async for session in db_engine.get_async_session():
+            fr = await session.execute(select(Friendship).where(Friendship.id == request_id))
+            row = fr.scalars().first()
+            if row:
+                peer_id = row.sender_id if row.receiver_id == user_id else row.receiver_id
+                direct_room = await room_service.create_direct_room(user_id, peer_id)
+                event = {
+                    "action": "direct_room_ready",
+                    "room_id": direct_room.id,
+                    "peer_id": peer_id,
+                }
+                await manager.send_personal_message(event, user_id)
+                await manager.send_personal_message(
+                    {
+                        "action": "direct_room_ready",
+                        "room_id": direct_room.id,
+                        "peer_id": user_id,
+                    },
+                    peer_id,
+                )
+                await pubsub.publish_message(event)
+                await pubsub.publish_message(
+                    {
+                        "action": "direct_room_ready",
+                        "room_id": direct_room.id,
+                        "peer_id": user_id,
+                    }
+                )
         return {"message": "Заявка принята"}
     except ValueError as e:
         # 404 — заявка не найдена или не принадлежит пользователю

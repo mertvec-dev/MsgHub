@@ -5,6 +5,9 @@ from app.backend.schemas.auth import (
     SessionInfo,
     SessionListResponse,
     LogoutResponse,
+    RevokeSessionResponse,
+    ProfileResponse,
+    ProfileUpdateRequest,
 )
 
 from app.backend.schemas.user import (
@@ -42,6 +45,10 @@ from app.backend.schemas.messages import (
 from app.backend.schemas.e2e import (
     E2EKeyRequest,
     PublicKeyResponse,
+    DevicePublicKeyRequest,
+    DevicePublicKeyResponse,
+    PeerDeviceKeyItem,
+    PeerDeviceKeysResponse,
     RoomKeyEnvelopeItem,
     RoomKeyEnvelopeUpsertRequest,
     RoomKeyEnvelopeResponse,
@@ -56,6 +63,9 @@ __all__ = [
     "SessionInfo",
     "SessionListResponse",
     "LogoutResponse",
+    "RevokeSessionResponse",
+    "ProfileResponse",
+    "ProfileUpdateRequest",
     
     # User
     "UserBase",
@@ -88,6 +98,10 @@ __all__ = [
     # E2E
     "E2EKeyRequest",
     "PublicKeyResponse",
+    "DevicePublicKeyRequest",
+    "DevicePublicKeyResponse",
+    "PeerDeviceKeyItem",
+    "PeerDeviceKeysResponse",
     "RoomKeyEnvelopeItem",
     "RoomKeyEnvelopeUpsertRequest",
     "RoomKeyEnvelopeResponse",

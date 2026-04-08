@@ -124,6 +124,11 @@ async def handle_message_from_redis(data: dict):
         # Уведомление персональное — обрабатывается на уровне роутера
         logger.debug(f"Уведомление о новой комнате {room_id}")
 
+    elif action == "direct_room_ready":
+        peer_id = data.get("peer_id")
+        if peer_id is not None:
+            await manager.send_personal_message(data, int(peer_id))
+
     # ─── Системное уведомление ───
     elif action == "system":
         await manager.broadcast(data)

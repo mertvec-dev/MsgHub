@@ -9,6 +9,7 @@ class MessageCreate(BaseModel):
     content: str = Field(..., min_length=1, max_length=8192)
     nonce: str = Field(..., min_length=12, max_length=12)
     key_version: int = Field(default=1, ge=1)
+    sender_device_id: Optional[str] = Field(default=None, max_length=255)
 
     @field_validator("content")
     @classmethod
@@ -37,6 +38,7 @@ class MessageResponse(BaseModel):
     id: int
     room_id: int
     sender_id: int
+    sender_device_id: Optional[str] = None
     sender_nickname: str 
     content: str
     nonce: str

@@ -11,6 +11,33 @@ class PublicKeyResponse(BaseModel):
     algorithm: str
     public_key: str
 
+
+class DevicePublicKeyRequest(BaseModel):
+    device_id: str = Field(min_length=8, max_length=255)
+    public_key: str = Field(min_length=32, max_length=4096)
+    algorithm: str = Field(default="p256-ecdh-v1", max_length=64)
+    device_name: str | None = Field(default=None, max_length=255)
+    device_type: str | None = Field(default=None, max_length=64)
+
+
+class DevicePublicKeyResponse(BaseModel):
+    user_id: int
+    device_id: str
+    algorithm: str
+    public_key: str
+
+
+class PeerDeviceKeyItem(BaseModel):
+    user_id: int
+    device_id: str
+    algorithm: str
+    public_key: str
+
+
+class PeerDeviceKeysResponse(BaseModel):
+    user_id: int
+    devices: list[PeerDeviceKeyItem]
+
 class RoomKeyEnvelopeItem(BaseModel):
     """Схема для конверта с публичным ключом E2E для шифрования сообщений в комнате"""
     user_id: int

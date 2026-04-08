@@ -22,8 +22,10 @@ from sqlalchemy.exc import IntegrityError
 from database.engine import db_engine
 from database.models.messages import Message
 from database.models.message_reads import MessageRead
+from database.models.devices import Device
 from database.models.rooms import Room
-from database.models.room_member import RoomMember
+from database.models.room_member import RoomMember, MembershipStatus
+from database.models.room_key_envelopes import RoomKeyEnvelope
 from database.models.users import User
 
 
@@ -47,6 +49,7 @@ class MessageService:
         content: str,
         nonce: str,
         key_version: Optional[int] = None,
+        sender_device_id: Optional[str] = None,
     ) -> Message:
         """
         Создаёт новое сообщение в комнате.
@@ -66,7 +69,9 @@ class MessageService:
                 select(RoomMember, Room)
                 .join(Room, RoomMember.room_id == Room.id)
                 .where(
-                    (RoomMember.room_id == room_id) & (RoomMember.user_id == sender_id)
+                    (RoomMember.room_id == room_id)
+                    & (RoomMember.user_id == sender_id)
+                    & (RoomMember.status != MembershipStatus.BANNED)
                 )
             )
             row = result.first()
@@ -76,11 +81,19 @@ class MessageService:
                 raise ValueError("Вы не являетесь участником этой комнаты")
 
             _member, room = row
+            await self._ensure_e2e_ready_for_send(
+                session=session,
+                room=room,
+                sender_id=sender_id,
+                sender_device_id=sender_device_id,
+                key_version=key_version,
+            )
 
             # 3. Создаём сообщение
             message = Message(
                 room_id=room_id,
                 sender_id=sender_id,
+                sender_device_id=sender_device_id,
                 content=content,  # ciphertext
                 nonce=nonce,
                 key_version=key_version or getattr(room, "current_key_version", 1) or 1,
@@ -95,6 +108,68 @@ class MessageService:
             await session.commit()
             await session.refresh(message)
             return message
+
+    async def _ensure_e2e_ready_for_send(
+        self,
+        session,
+        room: Room,
+        sender_id: int,
+        sender_device_id: Optional[str],
+        key_version: Optional[int],
+    ) -> None:
+        """
+        Серверная проверка готовности E2E перед отправкой.
+        Фронту не доверяем: если ключи/конверты не готовы, блокируем отправку.
+        """
+        if room.type == "direct":
+            if not sender_device_id:
+                raise ValueError("E2E не готово: отсутствует sender_device_id")
+
+            sender_device_res = await session.execute(
+                select(Device).where(
+                    Device.user_id == sender_id,
+                    Device.device_id == sender_device_id,
+                    Device.public_key.is_not(None),
+                )
+            )
+            if not sender_device_res.scalars().first():
+                raise ValueError("E2E не готово: ключ устройства отправителя не зарегистрирован")
+
+            members_res = await session.execute(
+                select(RoomMember.user_id).where(
+                    RoomMember.room_id == room.id,
+                    RoomMember.user_id != sender_id,
+                    RoomMember.status != MembershipStatus.BANNED,
+                )
+            )
+            peer_ids = [int(uid) for uid in members_res.scalars().all()]
+            if not peer_ids:
+                raise ValueError("E2E не готово: собеседник не найден")
+
+            for peer_id in peer_ids:
+                peer_key_res = await session.execute(
+                    select(Device.id).where(
+                        Device.user_id == peer_id,
+                        Device.public_key.is_not(None),
+                    ).limit(1)
+                )
+                if not peer_key_res.scalars().first():
+                    raise ValueError("E2E не готово: у собеседника нет зарегистрированного ключа устройства")
+
+        elif room.type == "group":
+            expected_version = int(getattr(room, "current_key_version", 1) or 1)
+            if key_version is not None and int(key_version) != expected_version:
+                raise ValueError("E2E не готово: неверная версия ключа комнаты")
+
+            envelope_res = await session.execute(
+                select(RoomKeyEnvelope.id).where(
+                    RoomKeyEnvelope.room_id == room.id,
+                    RoomKeyEnvelope.user_id == sender_id,
+                    RoomKeyEnvelope.key_version == expected_version,
+                ).limit(1)
+            )
+            if not envelope_res.scalars().first():
+                raise ValueError("E2E не готово: отсутствует конверт ключа комнаты для отправителя")
 
     # ==========================================================================
     # ПОЛУЧЕНИЕ СООБЩЕНИЙ (CURSOR-ПАГИНАЦИЯ)
@@ -174,6 +249,7 @@ class MessageService:
                     "id": msg.id,
                     "room_id": msg.room_id,
                     "sender_id": msg.sender_id,
+                    "sender_device_id": msg.sender_device_id,
                     "sender_nickname": nickname,
                     "content": msg.content,  # ciphertext
                     "nonce": msg.nonce,
@@ -229,6 +305,7 @@ class MessageService:
                 "content": msg.content,  # ciphertext
                 "nonce": msg.nonce,
                 "key_version": msg.key_version,
+                "sender_device_id": msg.sender_device_id,
                 "created_at": msg.created_at.isoformat() if msg.created_at else None,
             }
 

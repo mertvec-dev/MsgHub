@@ -4,6 +4,24 @@ const API_URL =
   import.meta.env.VITE_API_URL ??
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost');
 let accessToken: string | null = null;
+const DEVICE_ID_KEY = 'msghub-device-id-v1';
+
+function ensureDeviceId(): string {
+  const existing = localStorage.getItem(DEVICE_ID_KEY);
+  if (existing) return existing;
+  const random = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  localStorage.setItem(DEVICE_ID_KEY, random);
+  return random;
+}
+
+function getDeviceMeta(): { device_id: string; device_name: string; device_type: string } {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown';
+  return {
+    device_id: ensureDeviceId(),
+    device_name: ua.slice(0, 255),
+    device_type: 'web',
+  };
+}
 
 /** Один общий refresh на параллельные 401 */
 let refreshInflight: Promise<void> | null = null;
@@ -50,6 +68,12 @@ export interface User {
   nickname: string;
   username: string;
   email?: string;
+  avatar_url?: string | null;
+  status_message?: string | null;
+  profile_tag?: string | null;
+  is_admin?: boolean;
+  is_banned?: boolean;
+  is_active?: boolean;
 }
 
 export interface AuthResponse {
@@ -91,6 +115,7 @@ export interface Message {
   room_id: number;
   sender_id: number;
   sender_nickname?: string;
+  sender_device_id?: string | null;
   content: string;
   nonce: string;
   key_version: number;
@@ -105,12 +130,39 @@ export interface MessageSendPayload {
   content: string; // ciphertext
   nonce: string;
   key_version: number;
+  sender_device_id?: string;
 }
 
 export interface MessageEditPayload {
   content: string; // ciphertext
   nonce: string;
   key_version: number;
+}
+
+export interface SessionInfo {
+  id: number;
+  device_id?: string | null;
+  device_info?: string | null;
+  ip_address?: string | null;
+  created_at: string;
+  expires_at: string;
+  last_active_at: string;
+}
+
+export interface SessionListResponse {
+  sessions: SessionInfo[];
+}
+
+export interface DeviceKeyItem {
+  user_id: number;
+  device_id: string;
+  algorithm: string;
+  public_key: string;
+}
+
+export interface PeerDeviceKeysResponse {
+  user_id: number;
+  devices: DeviceKeyItem[];
 }
 
 export interface Friendship {
@@ -197,13 +249,30 @@ api.interceptors.response.use(
 
 export const auth = {
   register: (n: string, u: string, p: string) =>
-    api.post<AuthResponse>('/auth/register', { nickname: n, username: u, password: p }),
+    api.post<AuthResponse>('/auth/register', { nickname: n, username: u, password: p }, {
+      headers: {
+        'X-Device-Id': getDeviceMeta().device_id,
+        'X-Device-Name': getDeviceMeta().device_name,
+        'X-Device-Type': 'web',
+      },
+    }),
   login: (u: string, p: string) =>
-    api.post<AuthResponse>('/auth/login', { username: u, password: p }),
+    api.post<AuthResponse>('/auth/login', { username: u, password: p, ...getDeviceMeta() }),
   /** Ручной refresh (редко нужен; основной путь — перехватчик 401) */
   refresh: () => refreshAccessToken(),
   logout: () => api.post('/auth/logout', {}),
-  getSessions: () => api.get('/auth/sessions'),
+  getSessions: () => api.get<SessionListResponse>('/auth/sessions'),
+  revokeSession: (sessionId: number) => api.delete(`/auth/sessions/${sessionId}`),
+  revokeOthers: () => api.post('/auth/sessions/revoke-others', {}),
+  getMe: () => api.get<User>('/auth/me'),
+  updateMe: (payload: Partial<Pick<User, 'nickname' | 'email' | 'avatar_url' | 'status_message' | 'profile_tag'>>) =>
+    api.patch<User>('/auth/me', payload),
+  adminListUsers: () => api.get<User[]>('/auth/admin/users'),
+  adminGrant: (userId: number) => api.post<User>(`/auth/admin/users/${userId}/grant-admin`, {}),
+  adminRevoke: (userId: number) => api.post<User>(`/auth/admin/users/${userId}/revoke-admin`, {}),
+  adminBan: (userId: number) => api.post<User>(`/auth/admin/users/${userId}/ban`, {}),
+  adminUnban: (userId: number) => api.post<User>(`/auth/admin/users/${userId}/unban`, {}),
+  adminDeactivate: (userId: number) => api.post<User>(`/auth/admin/users/${userId}/deactivate`, {}),
 };
 
 export const e2e = {
@@ -214,6 +283,15 @@ export const e2e = {
     }),
   getPublicKey: (userId: number) =>
     api.get<E2EPublicKeyResponse>(`/auth/e2e/public-key/${userId}`),
+  upsertDeviceKey: (publicKey: string, algorithm = 'p256-ecdh-v1') =>
+    api.post('/auth/e2e/device-key', {
+      ...getDeviceMeta(),
+      public_key: publicKey,
+      algorithm,
+    }),
+  getPeerDeviceKeys: (userId: number) =>
+    api.get<PeerDeviceKeysResponse>(`/auth/e2e/device-keys/${userId}`),
+  getDeviceId: () => ensureDeviceId(),
 };
 
 export function setAccessToken(token: string | null): void {

@@ -31,8 +31,11 @@ class User(SQLModel, table=True):
     
     avatar_url: Optional[str] = Field(default=None)
     status_message: Optional[str] = Field(default=None)
+    profile_tag: Optional[str] = Field(default=None, max_length=32)
     
-    is_admin: bool = Field(default=False) # TODO: Сделать админку и функционал для админов
+    is_admin: bool = Field(default=False)
+    is_banned: bool = Field(default=False, index=True)
+    is_active: bool = Field(default=True, index=True)
     
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)

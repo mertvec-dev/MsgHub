@@ -24,6 +24,7 @@ class Message(SQLModel, table=True):
 
     room_id: int = Field(foreign_key="rooms.id", index=True)
     sender_id: int = Field(foreign_key="users.id", index=True)
+    sender_device_id: Optional[str] = Field(default=None, index=True)
 
     content: str = Field(...) # зашифрованный текст сообщения
     key_version: int = Field(default=1, index=True) # версия ключа для шифрования

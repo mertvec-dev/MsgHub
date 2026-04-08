@@ -18,6 +18,7 @@ from sqlmodel import select
 from database.engine import db_engine
 from database.models.users import User
 from database.models.friendships import Friendship, FriendshipStatus
+from app.backend.services.rooms_service import room_service
 
 
 # ============================================================================
@@ -111,9 +112,12 @@ class FriendsService:
             if not friendship:
                 raise ValueError("Заявка не найдена или уже обработана")
 
+            sender_id = friendship.sender_id
             friendship.status = FriendshipStatus.ACCEPTED
             friendship.updated_at = datetime.utcnow()
             await session.commit()
+            # Автосоздание direct-диалога после принятия дружбы.
+            await room_service.create_direct_room(user_id, sender_id)
             return True
 
     # ==========================================================================

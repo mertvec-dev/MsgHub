@@ -47,8 +47,8 @@ class ConnectionManager:
     """
 
     def __init__(self):
-        # Активные WebSocket-соединения на ЭТОМ сервере
-        self.active_connections: dict[int, WebSocket] = {}
+        # Активные WebSocket-соединения на ЭТОМ сервере (multi-device)
+        self.active_connections: dict[int, list[WebSocket]] = {}
 
         # Комнаты пользователей на ЭТОМ сервере
         self.user_rooms: dict[int, int] = {}
@@ -73,7 +73,8 @@ class ConnectionManager:
         1. Сохраняет в локальный словарь.
         2. Записывает в Redis — «юзер онлайн на этом сервере».
         """
-        self.active_connections[user_id] = websocket
+        sockets = self.active_connections.setdefault(user_id, [])
+        sockets.append(websocket)
 
         # Регистрируем онлайн-статус в Redis (TTL 60 сек — обновляется при reconnect)
         await redis_client.set(
@@ -96,6 +97,15 @@ class ConnectionManager:
 
         # Асинхронно удаляем из Redis
         asyncio.create_task(self._remove_from_redis(user_id))
+
+    def disconnect_socket(self, user_id: int, websocket: WebSocket):
+        """Удаляет конкретный сокет пользователя, не трогая остальные устройства."""
+        sockets = self.active_connections.get(user_id)
+        if not sockets:
+            return
+        self.active_connections[user_id] = [ws for ws in sockets if ws is not websocket]
+        if not self.active_connections[user_id]:
+            self.disconnect(user_id)
 
     async def _remove_from_redis(self, user_id: int):
         """Удаляет пользователя из Redis-ключей онлайна и комнат."""
@@ -147,12 +157,15 @@ class ConnectionManager:
 
         Если пользователь отключился — автоматически убирает из менеджера.
         """
-        if user_id in self.active_connections:
-            websocket = self.active_connections[user_id]
+        sockets = self.active_connections.get(user_id, [])
+        disconnected = []
+        for websocket in sockets:
             try:
                 await websocket.send_json(message)
             except Exception:
-                self.disconnect(user_id)
+                disconnected.append(websocket)
+        for ws in disconnected:
+            self.disconnect_socket(user_id, ws)
 
     async def broadcast_to_room(
         self,
@@ -165,23 +178,20 @@ class ConnectionManager:
 
         exclude_user_id — не отправлять этому пользователю (обычно отправителю).
         """
-        disconnected_users = []
-
         for uid, connected_room_id in list(self.user_rooms.items()):
             if connected_room_id == room_id:
                 if exclude_user_id and uid == exclude_user_id:
                     continue
 
                 if uid in self.active_connections:
-                    websocket = self.active_connections[uid]
-                    try:
-                        await websocket.send_json(message)
-                    except Exception:
-                        disconnected_users.append(uid)
+                    sockets = list(self.active_connections[uid])
+                    for websocket in sockets:
+                        try:
+                            await websocket.send_json(message)
+                        except Exception:
+                            self.disconnect_socket(uid, websocket)
 
-        # Чистим отключившихся
-        for uid in disconnected_users:
-            self.disconnect(uid)
+        # Очистка выполняется точечно через disconnect_socket в цикле отправки.
 
     async def broadcast(self, message: dict):
         """
@@ -189,15 +199,12 @@ class ConnectionManager:
 
         Используется для системных уведомлений.
         """
-        disconnected_users = []
-        for uid, websocket in list(self.active_connections.items()):
-            try:
-                await websocket.send_json(message)
-            except Exception:
-                disconnected_users.append(uid)
-
-        for uid in disconnected_users:
-            self.disconnect(uid)
+        for uid, sockets in list(self.active_connections.items()):
+            for websocket in list(sockets):
+                try:
+                    await websocket.send_json(message)
+                except Exception:
+                    self.disconnect_socket(uid, websocket)
 
     # ==========================================================================
     # ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЯХ
@@ -222,7 +229,7 @@ class ConnectionManager:
 
     def is_online(self, user_id: int) -> bool:
         """Проверяет, онлайн ли пользователь (на ЭТОМ сервере)."""
-        return user_id in self.active_connections
+        return bool(self.active_connections.get(user_id))
 
     async def is_online_global(self, user_id: int) -> bool:
         """

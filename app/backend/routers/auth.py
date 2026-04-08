@@ -13,10 +13,17 @@ from app.backend.schemas.auth import (
     SessionInfo,
     SessionListResponse,
     LogoutResponse,
+    RevokeSessionResponse,
+    ProfileResponse,
+    ProfileUpdateRequest,
 )
 from app.backend.schemas.e2e import (
     E2EKeyRequest,
     PublicKeyResponse,
+    DevicePublicKeyRequest,
+    DevicePublicKeyResponse,
+    PeerDeviceKeysResponse,
+    PeerDeviceKeyItem,
 )
 
 # Сервис аутентификации — вся бизнес-логика тут
@@ -108,6 +115,10 @@ async def register(request: Request, response: Response, data: RegisterRequest):
             nickname=data.nickname,
             username=data.username,
             password=data.password,
+            device_id=request.headers.get("X-Device-Id"),
+            device_name=request.headers.get("X-Device-Name", "Web"),
+            device_type=request.headers.get("X-Device-Type", "web"),
+            ip_address=request.client.host if request.client else "127.0.0.1",
         )
         _set_auth_cookies(response, tokens)
         return _response_payload(tokens)
@@ -142,7 +153,9 @@ async def login(request: Request, response: Response, data: LoginRequest):
         tokens = await auth_service.login(
             username=data.username,
             password=data.password,
-            device_info=device,
+            device_id=data.device_id or request.headers.get("X-Device-Id"),
+            device_name=data.device_name or device,
+            device_type=data.device_type or request.headers.get("X-Device-Type", "web"),
             ip_address=ip,
         )
         _set_auth_cookies(response, tokens)
@@ -229,6 +242,51 @@ async def get_sessions(user_id: int = Depends(get_current_user)):
 
     return SessionListResponse(sessions=sessions_list)
 
+
+@router.delete(
+    "/sessions/{session_id}",
+    response_model=RevokeSessionResponse,
+    summary="Завершить конкретную сессию",
+)
+async def revoke_session(session_id: int, user_id: int = Depends(get_current_user)):
+    ok = await auth_service.revoke_session(user_id, session_id)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Сессия не найдена")
+    return RevokeSessionResponse(message="Сессия завершена")
+
+
+@router.post(
+    "/sessions/revoke-others",
+    response_model=RevokeSessionResponse,
+    summary="Завершить все сессии кроме текущей",
+)
+async def revoke_other_sessions(request: Request, user_id: int = Depends(get_current_user)):
+    refresh_token = request.cookies.get("refresh_token")
+    if not refresh_token:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Refresh токен отсутствует")
+    revoked = await auth_service.revoke_all_except(user_id, refresh_token)
+    return RevokeSessionResponse(message=f"Завершено сессий: {revoked}")
+
+
+@router.get(
+    "/me",
+    response_model=ProfileResponse,
+    summary="Текущий профиль",
+)
+async def get_me(user_id: int = Depends(get_current_user)):
+    user = await auth_service.get_me(user_id)
+    return ProfileResponse.model_validate(user)
+
+
+@router.patch(
+    "/me",
+    response_model=ProfileResponse,
+    summary="Обновить профиль",
+)
+async def update_me(data: ProfileUpdateRequest, user_id: int = Depends(get_current_user)):
+    user = await auth_service.update_me(user_id, data.model_dump(exclude_none=True))
+    return ProfileResponse.model_validate(user)
+
 @router.post(
     "/e2e/public-key",
     response_model=PublicKeyResponse,
@@ -272,3 +330,109 @@ async def get_public_key(user_id: int):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
+
+
+@router.post(
+    "/e2e/device-key",
+    response_model=DevicePublicKeyResponse,
+    summary="Обновление публичного ключа текущего устройства",
+)
+async def upsert_device_public_key(
+    data: DevicePublicKeyRequest,
+    user_id: int = Depends(get_current_user),
+):
+    try:
+        item = await auth_service.upsert_device_public_key(
+            user_id=user_id,
+            device_id=data.device_id,
+            public_key=data.public_key,
+            algorithm=data.algorithm,
+            device_name=data.device_name,
+            device_type=data.device_type,
+        )
+        return DevicePublicKeyResponse(
+            user_id=item.user_id,
+            device_id=item.device_id,
+            algorithm=item.key_algorithm,
+            public_key=item.public_key or "",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.get(
+    "/e2e/device-keys/{peer_user_id}",
+    response_model=PeerDeviceKeysResponse,
+    summary="Получить ключи устройств собеседника",
+)
+async def get_peer_device_keys(peer_user_id: int, user_id: int = Depends(get_current_user)):
+    try:
+        devices = await auth_service.get_peer_device_keys(user_id, peer_user_id)
+        return PeerDeviceKeysResponse(
+            user_id=peer_user_id,
+            devices=[
+                PeerDeviceKeyItem(
+                    user_id=peer_user_id,
+                    device_id=d.device_id,
+                    algorithm=d.key_algorithm,
+                    public_key=d.public_key or "",
+                )
+                for d in devices
+            ],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
+@router.get("/admin/users", response_model=list[ProfileResponse], summary="Список пользователей (admin)")
+async def admin_list_users(user_id: int = Depends(get_current_user)):
+    try:
+        users = await auth_service.list_users_admin(user_id)
+        return [ProfileResponse.model_validate(u) for u in users]
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
+@router.post("/admin/users/{target_user_id}/grant-admin", response_model=ProfileResponse, summary="Выдать admin")
+async def admin_grant(target_user_id: int, user_id: int = Depends(get_current_user)):
+    try:
+        user = await auth_service.set_admin(user_id, target_user_id, True)
+        return ProfileResponse.model_validate(user)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/admin/users/{target_user_id}/revoke-admin", response_model=ProfileResponse, summary="Снять admin")
+async def admin_revoke(target_user_id: int, user_id: int = Depends(get_current_user)):
+    try:
+        user = await auth_service.set_admin(user_id, target_user_id, False)
+        return ProfileResponse.model_validate(user)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/admin/users/{target_user_id}/ban", response_model=ProfileResponse, summary="Бан пользователя")
+async def admin_ban(target_user_id: int, user_id: int = Depends(get_current_user)):
+    try:
+        user = await auth_service.set_ban(user_id, target_user_id, True)
+        return ProfileResponse.model_validate(user)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/admin/users/{target_user_id}/unban", response_model=ProfileResponse, summary="Разбан пользователя")
+async def admin_unban(target_user_id: int, user_id: int = Depends(get_current_user)):
+    try:
+        user = await auth_service.set_ban(user_id, target_user_id, False)
+        return ProfileResponse.model_validate(user)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/admin/users/{target_user_id}/deactivate", response_model=ProfileResponse, summary="Деактивация аккаунта")
+async def admin_deactivate(target_user_id: int, user_id: int = Depends(get_current_user)):
+    try:
+        user = await auth_service.set_active(user_id, target_user_id, False)
+        return ProfileResponse.model_validate(user)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))

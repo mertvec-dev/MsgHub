@@ -1,5 +1,6 @@
 const KEY_ALIAS = 'msghub-e2e-p256-private-jwk-v1';
 const ROOM_KEY_PREFIX = 'msghub-e2e-room-key-v1';
+const PEER_DERIVED_CACHE_PREFIX = 'msghub-peer-derived-cache-v1';
 
 type JsonWebKeyWithKid = JsonWebKey & { kid?: string };
 
@@ -103,6 +104,10 @@ async function deriveAesKey(peerPublicKeyB64: string): Promise<CryptoKey> {
 
 function roomKeyStorageKey(roomId: number, keyVersion: number): string {
   return `${ROOM_KEY_PREFIX}:${roomId}:${keyVersion}`;
+}
+
+function peerCacheKey(peerUserId: number, peerDeviceId: string): string {
+  return `${PEER_DERIVED_CACHE_PREFIX}:${peerUserId}:${peerDeviceId}`;
 }
 
 export async function encryptForPeer(
@@ -229,5 +234,17 @@ export async function decryptRoomKeyEnvelope(encryptedEnvelopeB64: string): Prom
     base64ToArrayBuffer(envelope.ciphertext)
   );
   return arrayBufferToBase64(plain);
+}
+
+export async function warmupPeerDeviceKey(peerPublicKeyB64: string): Promise<void> {
+  await deriveAesKey(peerPublicKeyB64);
+}
+
+export function markPeerWarm(peerUserId: number, peerDeviceId: string): void {
+  localStorage.setItem(peerCacheKey(peerUserId, peerDeviceId), String(Date.now()));
+}
+
+export function isPeerWarm(peerUserId: number, peerDeviceId: string): boolean {
+  return Boolean(localStorage.getItem(peerCacheKey(peerUserId, peerDeviceId)));
 }
 
