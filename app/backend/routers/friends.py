@@ -5,34 +5,25 @@
 # ============================================================================
 # ИМПОРТЫ
 # ============================================================================
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, Depends, Request
 
-# Логирование вместо print()
 import logging
 
-# SQLModel-запросы к БД
-from sqlmodel import select
-
-# Pydantic-схемы
 from app.backend.schemas.friends import FriendRequest
 
 # Сервис друзей — бизнес-логика
 from app.backend.services.friends_service import friends_service
-from app.backend.services.rooms_service import room_service
-from app.backend.services import pubsub
+from app.backend.services.auth_service import auth_service
+from app.backend.services.realtime_bus import realtime_bus
+from app.backend.services.e2e_orchestrator import e2e_orchestrator
+from app.backend.utils.rate_limiter import limiter
+from app.backend.config import settings
 
 # Получение user_id из JWT-токена
 from app.backend.utils.jwt_utils import get_current_user
 
 # WebSocket менеджер — для отображения онлайн-статуса
 from app.backend.websocket import manager
-
-# Асинхронная сессия БД
-from database.engine import db_engine
-
-# ORM-модели
-from database.models.users import User
-from database.models.friendships import Friendship
 
 logger = logging.getLogger(__name__)
 
@@ -51,20 +42,23 @@ router = APIRouter(prefix="/friends", tags=["friends"])
     summary="Отправить заявку в друзья",
     description="Создаёт заявку со статусом 'pending'"
 )
-async def send_request(data: FriendRequest, user_id: int = Depends(get_current_user)):
+@limiter.limit(settings.RATE_LIMIT_FRIEND_REQUEST)
+async def send_request(request: Request, data: FriendRequest, user_id: int = Depends(get_current_user)):
     """
     Принимает username пользователя, которому хотим отправить заявку
     Сервис ищет пользователя по username, проверяет что не себе и не дубликат
     """
-    try:
-        await friends_service.send_request(user_id, data.username)
-        return {"message": "Заявка отправлена"}
-    except ValueError as e:
-        # 400 — пользователь не найден, уже в друзьях, или заявка уже есть
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
+    result = await friends_service.send_request(user_id, data.username)
+    peer_id = int(result["peer_id"])
+    payload = {
+        "action": "friends_sync",
+        "reason": "request_created",
+        "from_user_id": user_id,
+        "peer_user_id": peer_id,
+    }
+    await realtime_bus.emit_personal_event(user_id=user_id, payload=payload)
+    await realtime_bus.emit_personal_event(user_id=peer_id, payload=payload)
+    return {"message": "Заявка отправлена"}
 
 
 @router.post(
@@ -72,48 +66,47 @@ async def send_request(data: FriendRequest, user_id: int = Depends(get_current_u
     summary="Принять заявку",
     description="Меняет статус заявки на 'accepted'"
 )
-async def accept_request(request_id: int, user_id: int = Depends(get_current_user)):
+@limiter.limit(settings.RATE_LIMIT_FRIEND_REQUEST)
+async def accept_request(request: Request, request_id: int, user_id: int = Depends(get_current_user)):
     """
     Принимает входящую заявку.
     Проверяет что текущий пользователь — получатель заявки.
     """
-    try:
-        await friends_service.accept_request(user_id, request_id)
-        async for session in db_engine.get_async_session():
-            fr = await session.execute(select(Friendship).where(Friendship.id == request_id))
-            row = fr.scalars().first()
-            if row:
-                peer_id = row.sender_id if row.receiver_id == user_id else row.receiver_id
-                direct_room = await room_service.create_direct_room(user_id, peer_id)
-                event = {
-                    "action": "direct_room_ready",
-                    "room_id": direct_room.id,
-                    "peer_id": peer_id,
-                }
-                await manager.send_personal_message(event, user_id)
-                await manager.send_personal_message(
-                    {
-                        "action": "direct_room_ready",
-                        "room_id": direct_room.id,
-                        "peer_id": user_id,
-                    },
-                    peer_id,
-                )
-                await pubsub.publish_message(event)
-                await pubsub.publish_message(
-                    {
-                        "action": "direct_room_ready",
-                        "room_id": direct_room.id,
-                        "peer_id": user_id,
-                    }
-                )
-        return {"message": "Заявка принята"}
-    except ValueError as e:
-        # 404 — заявка не найдена или не принадлежит пользователю
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
+    result = await friends_service.accept_request(user_id, request_id)
+    peer_id = result["peer_id"]
+    room_id = result["room_id"]
+    readiness = await auth_service.get_direct_e2e_readiness(user_id, peer_id)
+
+    await realtime_bus.emit_personal_event(
+        user_id=user_id,
+        payload={
+            "action": "direct_room_ready",
+            "room_id": room_id,
+            "peer_id": peer_id,
+            "e2e_ready": readiness.get("ready", False),
+            "e2e_reason": readiness.get("reason"),
+        },
+    )
+    await realtime_bus.emit_personal_event(
+        user_id=peer_id,
+        payload={
+            "action": "direct_room_ready",
+            "room_id": room_id,
+            "peer_id": user_id,
+            "e2e_ready": readiness.get("ready", False),
+            "e2e_reason": readiness.get("reason"),
+        },
+    )
+    sync_payload = {
+        "action": "friends_sync",
+        "reason": "request_accepted",
+        "from_user_id": user_id,
+        "peer_user_id": peer_id,
+    }
+    await realtime_bus.emit_personal_event(user_id=user_id, payload=sync_payload)
+    await realtime_bus.emit_personal_event(user_id=peer_id, payload=sync_payload)
+    await e2e_orchestrator.sync_direct_pair(user_id, peer_id, reason="friend_request_accepted")
+    return {"message": "Заявка принята"}
 
 
 @router.post(
@@ -121,20 +114,33 @@ async def accept_request(request_id: int, user_id: int = Depends(get_current_use
     summary="Отклонить заявку",
     description="Удаляет заявку из БД"
 )
-async def decline_request(request_id: int, user_id: int = Depends(get_current_user)):
+@limiter.limit(settings.RATE_LIMIT_FRIEND_REQUEST)
+async def decline_request(request: Request, request_id: int, user_id: int = Depends(get_current_user)):
     """
     Отклоняет входящую заявку.
     Проверяет что текущий пользователь — получатель заявки.
     """
-    try:
-        await friends_service.decline_request(user_id, request_id)
-        return {"message": "Заявка отклонена"}
-    except ValueError as e:
-        # 404 — заявка не найдена
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
+    result = await friends_service.decline_request(user_id, request_id)
+    peer_id = int(result["peer_id"])
+    await realtime_bus.emit_personal_event(
+        user_id=user_id,
+        payload={
+            "action": "friends_sync",
+            "reason": "request_declined",
+            "from_user_id": user_id,
+            "peer_user_id": peer_id,
+        },
+    )
+    await realtime_bus.emit_personal_event(
+        user_id=peer_id,
+        payload={
+            "action": "friends_sync",
+            "reason": "request_declined",
+            "from_user_id": user_id,
+            "peer_user_id": peer_id,
+        },
+    )
+    return {"message": "Заявка отклонена"}
 
 
 @router.post(
@@ -142,15 +148,52 @@ async def decline_request(request_id: int, user_id: int = Depends(get_current_us
     summary="Заблокировать пользователя",
     description="Помечает связь как blocked; повторные заявки от этой стороны невозможны",
 )
-async def block_user(target_user_id: int, user_id: int = Depends(get_current_user)):
-    try:
-        await friends_service.block_user(user_id, target_user_id)
-        return {"message": "Пользователь заблокирован"}
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
+@limiter.limit(settings.RATE_LIMIT_FRIEND_BLOCK)
+async def block_user(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
+    await friends_service.block_user(user_id, target_user_id)
+    affected_room_ids = await friends_service.enforce_block_for_direct_chat(user_id, target_user_id)
+    payload_for_actor = {
+        "action": "direct_blocked",
+        "by_user_id": user_id,
+        "target_user_id": target_user_id,
+        "room_ids": affected_room_ids,
+    }
+    payload_for_target = {
+        "action": "direct_blocked",
+        "by_user_id": user_id,
+        "target_user_id": target_user_id,
+        "room_ids": affected_room_ids,
+    }
+    await realtime_bus.emit_personal_event(user_id=user_id, payload=payload_for_actor)
+    await realtime_bus.emit_personal_event(user_id=target_user_id, payload=payload_for_target)
+    sync_payload = {
+        "action": "friends_sync",
+        "reason": "user_blocked",
+        "from_user_id": user_id,
+        "peer_user_id": target_user_id,
+    }
+    await realtime_bus.emit_personal_event(user_id=user_id, payload=sync_payload)
+    await realtime_bus.emit_personal_event(user_id=target_user_id, payload=sync_payload)
+    return {"message": "Пользователь заблокирован"}
+
+
+@router.post(
+    "/unblock/{target_user_id}",
+    summary="Разблокировать пользователя",
+    description="Удаляет пользователя из вашего ЧС",
+)
+@limiter.limit(settings.RATE_LIMIT_FRIEND_BLOCK)
+async def unblock_user(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
+    await friends_service.unblock_user(user_id, target_user_id)
+    payload = {
+        "action": "friends_sync",
+        "reason": "user_unblocked",
+        "from_user_id": user_id,
+        "peer_user_id": target_user_id,
+    }
+    await realtime_bus.emit_personal_event(user_id=user_id, payload=payload)
+    await realtime_bus.emit_personal_event(user_id=target_user_id, payload=payload)
+    return {"message": "Пользователь разблокирован"}
 
 
 @router.delete(
@@ -162,15 +205,26 @@ async def remove_friend(friend_id: int, user_id: int = Depends(get_current_user)
     """
     Полностью удаляет связь дружбы (обе записи — sender и receiver).
     """
-    try:
-        await friends_service.remove_friend(user_id, friend_id)
-        return {"message": "Удален из друзей"}
-    except ValueError as e:
-        # 400 — запись не найдена
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
+    await friends_service.remove_friend(user_id, friend_id)
+    await realtime_bus.emit_personal_event(
+        user_id=user_id,
+        payload={
+            "action": "friends_sync",
+            "reason": "friend_removed",
+            "from_user_id": user_id,
+            "peer_user_id": friend_id,
+        },
+    )
+    await realtime_bus.emit_personal_event(
+        user_id=friend_id,
+        payload={
+            "action": "friends_sync",
+            "reason": "friend_removed",
+            "from_user_id": user_id,
+            "peer_user_id": friend_id,
+        },
+    )
+    return {"message": "Удален из друзей"}
 
 
 @router.get(
@@ -189,37 +243,5 @@ async def get_friends(user_id: int = Depends(get_current_user)):
 
     Для каждой записи подтягивает информацию о втором участнике (партнёре).
     """
-    async for session in db_engine.get_async_session():
-        # Получаем все записи дружбы, где пользователь — либо отправитель, либо получатель
-        result = await session.execute(
-            select(Friendship).where(
-                (Friendship.sender_id == user_id) | (Friendship.receiver_id == user_id)
-            )
-        )
-        friendships = result.scalars().all()
-
-        # Для каждой записи находим партнёра и собираем ответ
-        response = []
-        for f in friendships:
-            # Определяем кто второй участник
-            partner_id = f.sender_id if f.receiver_id == user_id else f.receiver_id
-
-            # Ищем информацию о партнёре
-            partner_result = await session.execute(
-                select(User).where(User.id == partner_id)
-            )
-            partner = partner_result.scalars().first()
-
-            response.append({
-                "id": f.id,
-                "partner_id": partner_id,
-                "nickname": partner.nickname if partner else f"User#{partner_id}",
-                "username": partner.username if partner else "unknown",
-                "status": f.status,
-                "sender_id": f.sender_id,
-                "receiver_id": f.receiver_id,
-                "is_online": manager.is_online(partner_id),  # Проверка по WebSocket
-                "created_at": f.created_at.isoformat() if f.created_at else None,
-            })
-
-        return {"friends": response}
+    response = await friends_service.get_friends_overview(user_id, manager.is_online)
+    return {"friends": response}

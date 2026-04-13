@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 # Сервис сообщений — бизнес-логика
 from app.backend.services.messages_service import messages_service
-from app.backend.schemas.messages import MessageCreate, MessageEditRequest
+from app.backend.schemas.messages import MessageCreate, MessageEditRequest, MessagePinRequest
 
 # Сервис уведомлений — пометка прочитанных
 from app.backend.services.notification_service import notification_service
@@ -25,8 +25,7 @@ from app.backend.utils.jwt_utils import get_current_user
 # WebSocket менеджер — для real-time отправки
 from app.backend.websocket import manager
 
-# Pub/Sub — для синхронизации между инстансами
-from app.backend.services import pubsub
+from app.backend.services.realtime_bus import realtime_bus
 
 # Настройки (лимиты rate limiting)
 from app.backend.config import settings
@@ -50,8 +49,7 @@ async def _notify_messages_read(room_id: int, reader_id: int) -> None:
         "room_id": room_id,
         "reader_id": reader_id,
     }
-    await pubsub.publish_message(payload)
-    await manager.broadcast_to_room(payload, room_id)
+    await realtime_bus.emit_room_event(room_id=room_id, payload=payload)
 
 
 # ============================================================================
@@ -172,12 +170,15 @@ async def send_message(
             nonce=payload.nonce,
             key_version=payload.key_version,
             sender_device_id=payload.sender_device_id,
+            reply_to_message_id=payload.reply_to_message_id,
         )
 
         # Получаем никнейм отправителя для WebSocket (быстрый запрос)
         async for session in db_engine.get_async_session():
-            res = await session.execute(select(User.nickname).where(User.id == user_id))
-            sender_nickname = res.scalar() or "Unknown"
+            res = await session.execute(select(User.nickname, User.is_admin).where(User.id == user_id))
+            sender_row = res.first()
+            sender_nickname = sender_row.nickname if sender_row else "Unknown"
+            sender_is_admin = bool(sender_row.is_admin) if sender_row else False
 
         # 2. Подготавливаем данные для рассылки
         message_data = {
@@ -186,7 +187,13 @@ async def send_message(
             "room_id": msg.room_id,
             "sender_id": user_id,
             "sender_nickname": sender_nickname,
+            "sender_is_admin": sender_is_admin,
             "sender_device_id": msg.sender_device_id,
+            "reply_to_message_id": msg.reply_to_message_id,
+            "is_pinned": bool(getattr(msg, "is_pinned", False)),
+            "pinned_by_user_id": getattr(msg, "pinned_by_user_id", None),
+            "pinned_at": msg.pinned_at.isoformat() if getattr(msg, "pinned_at", None) else None,
+            "pin_note": getattr(msg, "pin_note", None),
             "content": msg.content,
             "nonce": msg.nonce,
             "key_version": msg.key_version,
@@ -194,13 +201,10 @@ async def send_message(
             "is_edited": msg.is_edited,
         }
 
-        # 3. Публикуем в Redis
-        await pubsub.publish_message(message_data)
-
-        # 4. Отправляем через WebSocket ВСЕМ в комнате (включая отправителя)
+        # 3. Отправляем через RealtimeBus (локальный WS + Redis)
         online = manager.get_users_in_room(msg.room_id)
         logger.info(f"📡 WebSocket broadcast: room={msg.room_id}, online_users={online}")
-        await manager.broadcast_to_room(message_data, msg.room_id)
+        await realtime_bus.emit_room_event(room_id=msg.room_id, payload=message_data)
         logger.info(f"✅ Broadcast завершён")
 
         return {
@@ -209,6 +213,7 @@ async def send_message(
             "nonce": msg.nonce,
             "key_version": msg.key_version,
             "sender_device_id": msg.sender_device_id,
+            "reply_to_message_id": msg.reply_to_message_id,
             "timestamp": msg.created_at.isoformat() if hasattr(msg.created_at, 'isoformat') else str(msg.created_at),
         }
     except ValueError as e:
@@ -261,11 +266,8 @@ async def edit_message(
             "timestamp": msg.edited_at.isoformat() if hasattr(msg.edited_at, 'isoformat') else str(msg.edited_at),
         }
 
-        # 3. Публикуем в Redis
-        await pubsub.publish_message(message_data)
-
-        # 4. Отправляем через WebSocket всем в комнате
-        await manager.broadcast_to_room(message_data, msg.room_id)
+        # 3. Отправляем через RealtimeBus (локальный WS + Redis)
+        await realtime_bus.emit_room_event(room_id=msg.room_id, payload=message_data)
 
         return {"message": "Сообщение отредактировано"}
     except ValueError as e:
@@ -296,8 +298,7 @@ async def delete_message(
             "id": message_id,
             "room_id": room_id,
         }
-        await pubsub.publish_message(message_data)
-        await manager.broadcast_to_room(message_data, room_id)
+        await realtime_bus.emit_room_event(room_id=room_id, payload=message_data)
 
         return {"message": "Сообщение удалено"}
     except ValueError as e:
@@ -305,3 +306,62 @@ async def delete_message(
         if "не найдено" in detail:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+
+@router.post("/pin/{room_id}/{message_id}", summary="Закрепить сообщение")
+@limiter.limit(settings.RATE_LIMIT_DEFAULT)
+async def pin_message(
+    request: Request,
+    room_id: int,
+    message_id: int,
+    payload: MessagePinRequest,
+    user_id: int = Depends(get_current_user),
+):
+    try:
+        msg = await messages_service.pin_message(
+            room_id=room_id,
+            message_id=message_id,
+            actor_id=user_id,
+            pin_note=payload.pin_note,
+        )
+        await realtime_bus.emit_room_event(
+            room_id=room_id,
+            payload={
+                "action": "message_pinned",
+                "room_id": room_id,
+                "id": msg.id,
+                "pinned_by_user_id": msg.pinned_by_user_id,
+                "pinned_at": msg.pinned_at.isoformat() if msg.pinned_at else None,
+                "pin_note": msg.pin_note,
+            },
+        )
+        return {"message": "Сообщение закреплено"}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
+@router.post("/unpin/{room_id}/{message_id}", summary="Открепить сообщение")
+@limiter.limit(settings.RATE_LIMIT_DEFAULT)
+async def unpin_message(
+    request: Request,
+    room_id: int,
+    message_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    try:
+        msg = await messages_service.unpin_message(
+            room_id=room_id,
+            message_id=message_id,
+            actor_id=user_id,
+        )
+        await realtime_bus.emit_room_event(
+            room_id=room_id,
+            payload={
+                "action": "message_unpinned",
+                "room_id": room_id,
+                "id": msg.id,
+            },
+        )
+        return {"message": "Сообщение откреплено"}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))

@@ -1,6 +1,29 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useAuth } from '../context/AuthContext';
-import { useToast } from '../context/ToastContext';
+import Prism from 'prismjs';
+import 'prismjs/components/prism-rust';
+import 'prismjs/components/prism-go';
+import 'prismjs/components/prism-python';
+import 'prismjs/components/prism-c';
+import 'prismjs/components/prism-cpp';
+import 'prismjs/components/prism-csharp';
+import 'prismjs/components/prism-java';
+import 'prismjs/components/prism-javascript';
+import 'prismjs/components/prism-typescript';
+import 'prismjs/components/prism-kotlin';
+import 'prismjs/components/prism-swift';
+import 'prismjs/components/prism-php';
+import 'prismjs/components/prism-ruby';
+import 'prismjs/components/prism-scala';
+import 'prismjs/components/prism-sql';
+import 'prismjs/components/prism-bash';
+import 'prismjs/components/prism-powershell';
+import 'prismjs/components/prism-markup';
+import 'prismjs/components/prism-css';
+import 'prismjs/components/prism-json';
+import 'prismjs/components/prism-yaml';
+import 'prismjs/themes/prism-tomorrow.css';
+import { useAuth } from '../context/useAuth';
+import { useToast } from '../context/useToast';
 import {
   auth,
   rooms,
@@ -9,6 +32,9 @@ import {
   e2e,
   getRoomSidebarTitle,
   getAccessToken,
+  type AdminOverview,
+  type AdminAuditLogItem,
+  type SecurityEventItem,
   type Room,
   type Message,
 } from '../services/api';
@@ -29,7 +55,70 @@ import {
   markPeerWarm,
 } from '../services/e2e';
 import { getAlias, setAlias as setLocalAlias } from '../services/localAliases';
+import { apiErrorDetail } from '../chat/utils/apiError';
+import {
+  MAX_MESSAGE_CHARS,
+  sameId,
+  encryptedPlaceholder,
+  previewCacheStorageKey,
+  looksEncryptedPayload,
+  preferAlias,
+} from '../chat/utils/common';
+import { randomNonce } from '../chat/utils/crypto';
+import {
+  loadPreviewCache,
+  savePreviewCache,
+} from '../chat/storage/previewCacheStorage';
+import { usePendingOutbox } from '../chat/hooks/usePendingOutbox';
+import { searchTenorGifs, type TenorGifItem } from '../services/tenor';
 import '../styles/ChatPage.css';
+
+const SUPPORTED_CODE_LANGS = new Set<string>([
+  'rust',
+  'go',
+  'python',
+  'c',
+  'cpp',
+  'csharp',
+  'java',
+  'javascript',
+  'typescript',
+  'kotlin',
+  'swift',
+  'php',
+  'ruby',
+  'scala',
+  'sql',
+  'bash',
+  'powershell',
+  'markup',
+  'css',
+  'json',
+  'yaml',
+]);
+
+const CODE_LANG_ALIASES: Record<string, string> = {
+  rs: 'rust',
+  golang: 'go',
+  py: 'python',
+  cxx: 'cpp',
+  'c++': 'cpp',
+  cs: 'csharp',
+  'c#': 'csharp',
+  js: 'javascript',
+  jsx: 'javascript',
+  ts: 'typescript',
+  tsx: 'typescript',
+  javascript: 'javascript',
+  typescript: 'typescript',
+  kt: 'kotlin',
+  sh: 'bash',
+  shell: 'bash',
+  ps1: 'powershell',
+  psql: 'sql',
+  yml: 'yaml',
+  html: 'markup',
+};
 
 interface FriendRequest {
   id: number;
@@ -37,7 +126,9 @@ interface FriendRequest {
   receiver_id: number;
   nickname?: string;
   username?: string;
+  is_admin?: boolean;
   partner_id?: number;
+  is_admin?: boolean;
   status: 'pending' | 'accepted' | 'blocked';
 }
 
@@ -46,75 +137,22 @@ interface Friend {
   nickname: string;
   username: string;
   is_online: boolean;
+  is_admin?: boolean;
 }
 
 interface RoomMember {
   id: number;
   nickname: string;
   username: string;
+  is_admin?: boolean;
+  muted_until?: string | null;
+  muted_reason?: string | null;
 }
 
-interface PendingOutboxItem {
-  local_id: number;
-  room_id: number;
-  text: string;
-  created_at: string;
-  attempts: number;
-}
-
-const MAX_MESSAGE_CHARS = 1800;
-
-/** API/WS могут отдавать id числом или строкой — строгое === ломало удаление и обновление списка */
-function sameId(a: unknown, b: unknown): boolean {
-  if (a == null || b == null) return false;
-  return Number(a) === Number(b);
-}
-
-function apiErrorDetail(err: unknown, fallback: string): string {
-  const d = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
-  if (typeof d === 'string') return d;
-  if (Array.isArray(d)) {
-    const parts = d.map((item: unknown) =>
-      typeof item === 'object' && item !== null && 'msg' in item
-        ? String((item as { msg: string }).msg)
-        : String(item)
-    );
-    return parts.filter(Boolean).join(' ') || fallback;
-  }
-  return fallback;
-}
-
-function randomNonce(length = 12): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  const bytes = new Uint8Array(length);
-  crypto.getRandomValues(bytes);
-  let out = '';
-  for (let i = 0; i < bytes.length; i++) out += alphabet[bytes[i] % alphabet.length];
-  return out;
-}
-
-function encryptedPlaceholder(): string {
-  return '🔒 Encrypted message';
-}
-
-function previewCacheStorageKey(userId: number | null | undefined): string {
-  return `msghub-last-preview-v1:${userId ?? 'anon'}`;
-}
-
-function pendingOutboxStorageKey(userId: number | null | undefined): string {
-  return `msghub-pending-outbox-v1:${userId ?? 'anon'}`;
-}
-
-function looksEncryptedPayload(value: string | null | undefined): boolean {
-  if (!value) return false;
-  const trimmed = value.trim();
-  // Грубый эвристический детект base64/ciphertext, чтобы не показывать мусор в превью.
-  return trimmed.length >= 24 && /^[A-Za-z0-9+/=]+$/.test(trimmed);
-}
-
-function preferAlias(userId: number | null | undefined, fallback: string): string {
-  const alias = getAlias(userId);
-  return alias || fallback;
+interface PendingReply {
+  id: number;
+  sender_nickname?: string;
+  content: string;
 }
 
 export default function ChatPage() {
@@ -127,11 +165,13 @@ export default function ChatPage() {
   );
   const { showToast } = useToast();
   const [myRooms, setMyRooms] = useState<Room[]>([]);
+  const [roomsLoading, setRoomsLoading] = useState(false);
   const [selectedRoom, setSelectedRoom] = useState<Room | null>(null);
   const [msgList, setMsgList] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [roomMembers, setRoomMembers] = useState<RoomMember[]>([]);
   const [editingMsg, setEditingMsg] = useState<Message | null>(null);
+  const [replyTo, setReplyTo] = useState<PendingReply | null>(null);
   const [unreadCounts, setUnreadCounts] = useState<Record<number, number>>({});
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMoreMessages, setHasMoreMessages] = useState(true);
@@ -141,13 +181,21 @@ export default function ChatPage() {
   const myRoomsRef = useRef<Room[]>([]);
 
   // Меню
-  const [activeMenu, setActiveMenu] = useState<'chats' | 'friends' | 'requests' | 'settings'>('chats');
+  const [activeMenu, setActiveMenu] = useState<'chats' | 'friends' | 'requests' | 'settings' | 'admin'>('chats');
   const [friendList, setFriendList] = useState<Friend[]>([]);
   const [friendRequests, setFriendRequests] = useState<FriendRequest[]>([]);
+  const [blockedUsers, setBlockedUsers] = useState<Friend[]>([]);
+  const [newRequestIds, setNewRequestIds] = useState<Set<number>>(new Set());
+  const prevRequestIdsRef = useRef<Set<number>>(new Set());
   const [friendUsername, setFriendUsername] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [sendCooldown, setSendCooldown] = useState(false);
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [showGifPicker, setShowGifPicker] = useState(false);
+  const [gifQuery, setGifQuery] = useState('');
+  const [gifResults, setGifResults] = useState<TenorGifItem[]>([]);
+  const [gifLoading, setGifLoading] = useState(false);
 
   // Создание комнаты
   const [showCreateRoom, setShowCreateRoom] = useState(false);
@@ -166,9 +214,14 @@ export default function ChatPage() {
   const roomSidebarContextMenuRef = useRef<HTMLDivElement>(null);
   const roomHeaderActionsRef = useRef<HTMLDivElement>(null);
   const roomHeaderDropdownRef = useRef<HTMLDivElement>(null);
+  const emojiPickerRef = useRef<HTMLDivElement>(null);
+  const gifPickerRef = useRef<HTMLDivElement>(null);
   const profileMenuRef = useRef<HTMLDivElement>(null);
   const profileButtonRef = useRef<HTMLButtonElement>(null);
   const ws = useRef<WebSocket | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const recentEventIdsRef = useRef<Set<string>>(new Set());
   /** Актуальная комната для обработчиков WebSocket (иначе замыкание на старый selectedRoom). */
   const selectedRoomIdRef = useRef<number | null>(null);
   const selectedRoomTypeRef = useRef<'direct' | 'group' | null>(null);
@@ -192,55 +245,78 @@ export default function ChatPage() {
     status_message: '',
     profile_tag: '',
   });
-  const [adminUsers, setAdminUsers] = useState<Array<{ id: number; username: string; nickname: string; is_admin?: boolean; is_banned?: boolean }>>([]);
-  const [pendingOutbox, setPendingOutbox] = useState<PendingOutboxItem[]>([]);
-  const pendingOutboxRef = useRef<PendingOutboxItem[]>([]);
+  const [adminUsers, setAdminUsers] = useState<Array<{ id: number; username: string; nickname: string; is_admin?: boolean; is_banned?: boolean; role?: string; profile_tag?: string | null }>>([]);
+  const [adminTagDraftByUser, setAdminTagDraftByUser] = useState<Record<number, string>>({});
+  const [adminOverview, setAdminOverview] = useState<AdminOverview | null>(null);
+  const [adminLogs, setAdminLogs] = useState<AdminAuditLogItem[]>([]);
+  const [securityEvents, setSecurityEvents] = useState<SecurityEventItem[]>([]);
+  const [myPermissions, setMyPermissions] = useState<string[]>([]);
+  const [myRole, setMyRole] = useState<'user' | 'moderator' | 'super_admin'>('user');
+  const [isMobileView, setIsMobileView] = useState<boolean>(typeof window !== 'undefined' ? window.innerWidth <= 900 : false);
+  const adminBadge = (visible?: boolean, role?: string) => {
+    if (!visible) return null;
+    if (role === 'super_admin') return <span className="admin-badge super">SUPER_ADMIN</span>;
+    return <span className="admin-badge">ADMIN</span>;
+  };
+  const isInputLimitExceeded = input.length > MAX_MESSAGE_CHARS;
+
+  const renderMarkdown = useCallback((raw: string): { __html: string } => {
+    const escapeHtml = (value: string): string =>
+      value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+
+    const safeUrl = (url: string): string | null => {
+      const trimmed = url.trim();
+      return /^https?:\/\//i.test(trimmed) ? trimmed : null;
+    };
+
+    let html = escapeHtml(raw);
+    html = html.replace(
+      /```([a-zA-Z0-9#+._-]+)?\n([\s\S]*?)```/g,
+      (_m, lang: string | undefined, code: string) => {
+        const rawLang = String(lang ?? '').trim().toLowerCase();
+        const normalizedLang = CODE_LANG_ALIASES[rawLang] ?? rawLang;
+        const isSupported = SUPPORTED_CODE_LANGS.has(normalizedLang);
+        const langBadgeLabel = rawLang
+          ? (isSupported ? normalizedLang : 'text')
+          : '';
+        const prismLang = normalizedLang === 'html' ? 'markup' : normalizedLang;
+        const prismGrammar = Prism.languages[prismLang];
+        const highlighted = prismGrammar
+          ? Prism.highlight(code.trimEnd(), prismGrammar, prismLang)
+          : code.trimEnd();
+        const langBadge = langBadgeLabel
+          ? `<div class="md-code-lang ${isSupported ? 'supported' : 'fallback'}">${langBadgeLabel}</div>`
+          : '';
+        return `<pre class="md-code-block">${langBadge}<code class="language-${prismLang}">${highlighted}</code></pre>`;
+      }
+    );
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label: string, href: string) => {
+      const safe = safeUrl(href);
+      if (!safe) return label;
+      return `<a href="${safe}" target="_blank" rel="noreferrer noopener">${label}</a>`;
+    });
+    html = html.replace(/\n/g, '<br/>');
+    return { __html: html };
+  }, []);
+
+  const { pendingOutbox, setPendingOutbox, pendingOutboxRef } = usePendingOutbox(userId);
   useEffect(() => {
     selectedRoomIdRef.current = selectedRoom?.id ?? null;
     selectedRoomTypeRef.current = selectedRoom?.type ?? null;
     selectedRoomRef.current = selectedRoom ?? null;
+    setReplyTo(null);
   }, [selectedRoom]);
   useEffect(() => {
     activePeerPublicKeyRef.current = activePeerPublicKey;
   }, [activePeerPublicKey]);
-  useEffect(() => {
-    pendingOutboxRef.current = pendingOutbox;
-  }, [pendingOutbox]);
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(pendingOutboxStorageKey(userId));
-      if (!raw) {
-        setPendingOutbox([]);
-        return;
-      }
-      const parsed = JSON.parse(raw) as PendingOutboxItem[];
-      if (!Array.isArray(parsed)) {
-        setPendingOutbox([]);
-        return;
-      }
-      const sanitized = parsed.filter(
-        (item) =>
-          item &&
-          Number.isFinite(Number(item.local_id)) &&
-          Number.isFinite(Number(item.room_id)) &&
-          typeof item.text === 'string' &&
-          item.text.trim().length > 0
-      );
-      setPendingOutbox(sanitized);
-    } catch {
-      setPendingOutbox([]);
-    }
-  }, [userId]);
-  useEffect(() => {
-    try {
-      localStorage.setItem(
-        pendingOutboxStorageKey(userId),
-        JSON.stringify(pendingOutbox)
-      );
-    } catch {
-      // ignore storage errors
-    }
-  }, [pendingOutbox, userId]);
 
   // Загрузка данных
   const fetchPeerPublicKey = useCallback(async (partnerId: number): Promise<string | null> => {
@@ -293,7 +369,17 @@ export default function ChatPage() {
     [fetchPeerPublicKey, warmupPeerDevices]
   );
 
+  const checkDirectReadiness = useCallback(async (partnerId: number): Promise<boolean> => {
+    try {
+      const readiness = await e2e.getDirectReadiness(partnerId);
+      return Boolean(readiness.data.ready);
+    } catch {
+      return false;
+    }
+  }, []);
+
   const loadRooms = async () => {
+    setRoomsLoading(true);
     try {
       const r = await rooms.getMyRooms();
       const hydrated = r.data.map((room) => {
@@ -320,6 +406,8 @@ export default function ChatPage() {
       );
     } catch (e) {
       console.error('Ошибка загрузки комнат:', e);
+    } finally {
+      setRoomsLoading(false);
     }
   };
 
@@ -331,35 +419,15 @@ export default function ChatPage() {
   }, [lastCursor]);
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(previewCacheStorageKey(userId));
-      if (!raw) {
-        previewCacheRef.current = new Map();
-        return;
-      }
-      const parsed = JSON.parse(raw) as Record<string, string>;
-      const map = new Map<number, string>();
-      Object.entries(parsed).forEach(([key, value]) => {
-        const id = Number(key);
-        if (!Number.isNaN(id) && typeof value === 'string' && value.trim()) {
-          map.set(id, value);
-        }
-      });
-      previewCacheRef.current = map;
-    } catch {
-      previewCacheRef.current = new Map();
-    }
+    const storageKey = previewCacheStorageKey(userId);
+    previewCacheRef.current = loadPreviewCache(storageKey);
   }, [userId]);
 
   const setPreviewCache = useCallback((roomId: number, preview: string) => {
     if (!preview.trim()) return;
     previewCacheRef.current.set(roomId, preview);
-    try {
-      const obj = Object.fromEntries(previewCacheRef.current.entries());
-      localStorage.setItem(previewCacheStorageKey(userId), JSON.stringify(obj));
-    } catch {
-      // ignore storage errors
-    }
+    const storageKey = previewCacheStorageKey(userId);
+    savePreviewCache(storageKey, previewCacheRef.current);
   }, [userId]);
 
   const getRoomPreview = useCallback((room: Room): string => {
@@ -380,13 +448,27 @@ export default function ChatPage() {
       const allFriends = r.data.friends || [];
       const pending = allFriends.filter((f: { status: string }) => f.status === 'pending');
       const accepted = allFriends.filter((f: { status: string }) => f.status === 'accepted');
+      const blocked = allFriends.filter(
+        (f: { status: string; blocked_by_me?: boolean }) =>
+          f.status === 'blocked' && Boolean(f.blocked_by_me)
+      );
       setFriendRequests(pending);
-      setFriendList(accepted.map((f: { partner_id: number; nickname: string; username: string; is_online: boolean }) => ({
+      setFriendList(accepted.map((f: { partner_id: number; nickname: string; username: string; is_online: boolean; is_admin?: boolean }) => ({
         id: f.partner_id,
         nickname: f.nickname,
         username: f.username,
         is_online: f.is_online,
+        is_admin: Boolean(f.is_admin),
       })));
+      setBlockedUsers(
+        blocked.map((f: { partner_id: number; nickname: string; username: string; is_online: boolean; is_admin?: boolean }) => ({
+          id: f.partner_id,
+          nickname: f.nickname,
+          username: f.username,
+          is_online: f.is_online,
+          is_admin: Boolean(f.is_admin),
+        }))
+      );
     } catch (e) {
       console.error(e);
     }
@@ -400,6 +482,59 @@ export default function ChatPage() {
       console.error('Ошибка загрузки непрочитанных:', e);
     }
   };
+
+  useEffect(() => {
+    const prevIds = prevRequestIdsRef.current;
+    const currentIds = new Set(friendRequests.map((req) => Number(req.id)));
+    const addedIds = [...currentIds].filter((id) => !prevIds.has(id));
+    if (addedIds.length > 0) {
+      setNewRequestIds((prev) => {
+        const next = new Set(prev);
+        for (const id of addedIds) next.add(id);
+        return next;
+      });
+      const timer = window.setTimeout(() => {
+        setNewRequestIds((prev) => {
+          const next = new Set(prev);
+          for (const id of addedIds) next.delete(id);
+          return next;
+        });
+      }, 3800);
+      prevRequestIdsRef.current = currentIds;
+      return () => window.clearTimeout(timer);
+    }
+    prevRequestIdsRef.current = currentIds;
+    return undefined;
+  }, [friendRequests]);
+
+  useEffect(() => {
+    const onResize = () => setIsMobileView(window.innerWidth <= 900);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  useEffect(() => {
+    if (!showGifPicker) return;
+    const q = gifQuery.trim();
+    if (!q) {
+      setGifResults([]);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        setGifLoading(true);
+        try {
+          const items = await searchTenorGifs(q, 18);
+          setGifResults(items);
+        } catch {
+          setGifResults([]);
+        } finally {
+          setGifLoading(false);
+        }
+      })();
+    }, 280);
+    return () => window.clearTimeout(timer);
+  }, [gifQuery, showGifPicker]);
 
   const loadRoomMembers = async (roomId: number) => {
     try {
@@ -423,9 +558,22 @@ export default function ChatPage() {
         status_message: res.data.status_message || '',
         profile_tag: res.data.profile_tag || '',
       });
+      setMyRole((res.data.role as 'user' | 'moderator' | 'super_admin') || 'user');
     }).catch(() => {});
     if (isAdmin) {
-      void auth.adminListUsers().then((res) => setAdminUsers(res.data || [])).catch(() => {});
+      void auth.adminListUsers().then((res) => {
+        const users = res.data || [];
+        setAdminUsers(users);
+        const initialDrafts: Record<number, string> = {};
+        for (const u of users) {
+          initialDrafts[Number(u.id)] = u.profile_tag ?? '';
+        }
+        setAdminTagDraftByUser(initialDrafts);
+      }).catch(() => {});
+      void auth.adminOverview().then((res) => setAdminOverview(res.data)).catch(() => {});
+      void auth.adminAuditLogs(20).then((res) => setAdminLogs(res.data || [])).catch(() => {});
+      void auth.adminSecurityEvents(20).then((res) => setSecurityEvents(res.data || [])).catch(() => {});
+      void auth.adminMyPermissions().then((res) => setMyPermissions(res.data.permissions || [])).catch(() => {});
     }
   }, []);
 
@@ -459,7 +607,7 @@ export default function ChatPage() {
       if (cached) {
         setActivePeerPublicKey(cached);
         await warmupPeerDevices(partnerId);
-        setDirectHandshakeReady(true);
+        setDirectHandshakeReady(await checkDirectReadiness(partnerId));
         setDirectHandshakeBusy(false);
         return;
       }
@@ -469,7 +617,7 @@ export default function ChatPage() {
           if (!key) throw new Error('no-key');
           setActivePeerPublicKey(key);
           await warmupPeerDevices(partnerId);
-          setDirectHandshakeReady(true);
+          setDirectHandshakeReady(await checkDirectReadiness(partnerId));
           setDirectHandshakeBusy(false);
           return;
         } catch (err) {
@@ -483,7 +631,7 @@ export default function ChatPage() {
         }
       }
     })();
-  }, [selectedRoom?.id, selectedRoom?.type, selectedRoom?.partner_id, peerKeyRetryTick]);
+  }, [selectedRoom?.id, selectedRoom?.type, selectedRoom?.partner_id, peerKeyRetryTick, checkDirectReadiness]);
 
   // Если ключ собеседника временно недоступен (еще не загрузился/не опубликован),
   // периодически повторяем попытку, чтобы шифрование/дешифрование оживало без перезагрузки страницы.
@@ -503,10 +651,10 @@ export default function ChatPage() {
     void (async () => {
       setDirectHandshakeBusy(true);
       await warmupPeerDevices(partnerId);
-      setDirectHandshakeReady(true);
+      setDirectHandshakeReady(await checkDirectReadiness(partnerId));
       setDirectHandshakeBusy(false);
     })();
-  }, [selectedRoom?.id, selectedRoom?.type, selectedRoom?.partner_id, activePeerPublicKey, directHandshakeReady, warmupPeerDevices]);
+  }, [selectedRoom?.id, selectedRoom?.type, selectedRoom?.partner_id, activePeerPublicKey, directHandshakeReady, warmupPeerDevices, checkDirectReadiness]);
 
   const getCachedRoomKey = useCallback((roomId: number, keyVersion: number): string | null => {
     const cacheKey = `${roomId}:${keyVersion}`;
@@ -589,7 +737,8 @@ export default function ChatPage() {
     }
 
     console.log("🔌 Подключение WebSocket...", WS_URL);
-    ws.current = new WebSocket(WS_URL);
+    const socket = new WebSocket(WS_URL);
+    ws.current = socket;
 
     const sendJoinRoom = () => {
       const rid = selectedRoomIdRef.current;
@@ -597,14 +746,24 @@ export default function ChatPage() {
       ws.current.send(JSON.stringify({ action: 'join_room', room_id: rid }));
     };
 
-    ws.current.onopen = () => {
+    socket.onopen = () => {
+      reconnectAttemptRef.current = 0;
       console.log('✅ Соединение открыто, отправляю auth...');
-      ws.current?.send(JSON.stringify({ action: 'auth', token }));
+      socket.send(JSON.stringify({ action: 'auth', token }));
     };
 
-    ws.current.onmessage = (event) => {
+    socket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
+        const eventId = typeof data.event_id === 'string' ? data.event_id : null;
+        if (eventId) {
+          if (recentEventIdsRef.current.has(eventId)) return;
+          recentEventIdsRef.current.add(eventId);
+          if (recentEventIdsRef.current.size > 400) {
+            const firstId = recentEventIdsRef.current.values().next().value;
+            if (typeof firstId === 'string') recentEventIdsRef.current.delete(firstId);
+          }
+        }
         const roomOpen = selectedRoomIdRef.current;
 
         if (data.action === 'authenticated') {
@@ -683,6 +842,12 @@ export default function ChatPage() {
                     id: data.id,
                     sender_id: data.sender_id,
                     sender_nickname: nickname,
+                    sender_is_admin: Boolean(data.sender_is_admin),
+                    reply_to_message_id: data.reply_to_message_id ?? null,
+                    is_pinned: Boolean(data.is_pinned),
+                    pinned_by_user_id: data.pinned_by_user_id ?? null,
+                    pinned_at: data.pinned_at ?? null,
+                    pin_note: data.pin_note ?? null,
                     content: resolvedContent,
                     nonce: data.nonce ?? randomNonce(12),
                     key_version: Number(data.key_version ?? 1),
@@ -749,6 +914,21 @@ export default function ChatPage() {
               loadRooms();
             }
             break;
+          case 'direct_blocked':
+            if (Array.isArray(data.room_ids) && data.room_ids.length > 0) {
+              const blockedIds = new Set<number>(data.room_ids.map((v: unknown) => Number(v)));
+              setMyRooms((prev) => prev.filter((room) => !blockedIds.has(Number(room.id))));
+              if (selectedRoomRef.current && blockedIds.has(Number(selectedRoomRef.current.id))) {
+                setSelectedRoom(null);
+                setMsgList([]);
+              }
+              await loadUnreadCounts();
+              showToast('Direct-чат заблокирован администратором/пользователем', 'info');
+            }
+            break;
+          case 'friends_sync':
+            await loadFriendsData();
+            break;
           case 'message_edited':
             if (sameId(data.room_id, roomOpen)) {
               void (async () => {
@@ -809,6 +989,40 @@ export default function ChatPage() {
               setMsgList((prev) => prev.filter((msg) => !sameId(msg.id, data.id)));
             }
             break;
+          case 'message_pinned':
+            if (sameId(data.room_id, roomOpen)) {
+              setMsgList((prev) =>
+                prev.map((m) =>
+                  sameId(m.id, data.id)
+                    ? {
+                        ...m,
+                        is_pinned: true,
+                        pinned_by_user_id: data.pinned_by_user_id ?? null,
+                        pinned_at: data.pinned_at ?? null,
+                        pin_note: data.pin_note ?? null,
+                      }
+                    : m
+                )
+              );
+            }
+            break;
+          case 'message_unpinned':
+            if (sameId(data.room_id, roomOpen)) {
+              setMsgList((prev) =>
+                prev.map((m) =>
+                  sameId(m.id, data.id)
+                    ? {
+                        ...m,
+                        is_pinned: false,
+                        pinned_by_user_id: null,
+                        pinned_at: null,
+                        pin_note: null,
+                      }
+                    : m
+                )
+              );
+            }
+            break;
           case 'new_room':
             loadRooms();
             break;
@@ -816,8 +1030,49 @@ export default function ChatPage() {
             if (data.peer_id != null) {
               void fetchPeerPublicKey(Number(data.peer_id));
               void warmupPeerDevices(Number(data.peer_id));
+              if (data.e2e_ready === true) {
+                setDirectHandshakeReady(true);
+              }
+              if (data.e2e_ready === false) {
+                setDirectHandshakeReady(false);
+                setPeerKeyRetryTick((v) => v + 1);
+              }
             }
             loadRooms();
+            break;
+          case 'direct_e2e_state':
+            if (data.peer_id != null && selectedRoomRef.current?.type === 'direct') {
+              if (Number(selectedRoomRef.current.partner_id) === Number(data.peer_id)) {
+                setDirectHandshakeReady(Boolean(data.ready));
+                if (data.ready) {
+                  void fetchPeerPublicKey(Number(data.peer_id));
+                  void warmupPeerDevices(Number(data.peer_id));
+                } else {
+                  setPeerKeyRetryTick((v) => v + 1);
+                }
+              }
+            }
+            break;
+          case 'user_banned':
+            showToast('Ваш аккаунт ограничен администратором', 'error');
+            logout();
+            break;
+          case 'user_unbanned':
+            showToast('Ограничение аккаунта снято', 'success');
+            break;
+          case 'role_changed':
+            showToast('Ваши права обновлены, перезагружаю интерфейс', 'info');
+            window.setTimeout(() => window.location.reload(), 350);
+            break;
+          case 'member_muted':
+            if (Number(data.user_id) === Number(userId)) {
+              showToast('Вам выдан timeout в этой группе', 'error');
+            }
+            break;
+          case 'member_unmuted':
+            if (Number(data.user_id) === Number(userId)) {
+              showToast('Timeout в группе снят', 'success');
+            }
             break;
           case 'messages_read':
             if (
@@ -839,16 +1094,23 @@ export default function ChatPage() {
       }
     };
 
-    ws.current.onclose = () => {
+    socket.onclose = () => {
       console.log('❌ WebSocket отключился');
+      scheduleReconnect();
     };
     return () => {
-      if (ws.current) {
-        ws.current.close();
+      if (reconnectTimerRef.current != null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (socket) {
+        socket.close();
+      }
+      if (ws.current === socket) {
         ws.current = null;
       }
     };
-  }, [userId, isMe, fetchPeerPublicKey, warmupPeerDevices, resolvePeerPublicKey]);
+  }, [userId, isMe, fetchPeerPublicKey, warmupPeerDevices, resolvePeerPublicKey, scheduleReconnect]);
 
   // Смена комнаты: снова join_room (сокет уже авторизован с сервера)
   useEffect(() => {
@@ -1061,7 +1323,43 @@ export default function ChatPage() {
     setPreviewCache(room.id, text);
   }, [setPreviewCache, showToast, userId]);
 
-  const sendEncryptedText = useCallback(async (room: Room, text: string, localId?: number): Promise<boolean> => {
+  const scheduleReconnect = useCallback(() => {
+    if (reconnectTimerRef.current != null) return;
+    const attempt = reconnectAttemptRef.current;
+    const backoffMs = Math.min(12_000, 1_000 * (2 ** attempt));
+    reconnectTimerRef.current = window.setTimeout(() => {
+      reconnectTimerRef.current = null;
+      reconnectAttemptRef.current += 1;
+      loadRooms();
+      if (selectedRoomRef.current) {
+        void loadMessages(selectedRoomRef.current.id, false);
+      }
+      setPeerKeyRetryTick((v) => v + 1);
+    }, backoffMs);
+  }, []);
+
+  const appendEmoji = (emoji: string) => {
+    setInput((prev) => `${prev}${emoji}`);
+  };
+
+  const sendGif = async (gifUrl: string) => {
+    if (!selectedRoom) return;
+    try {
+      await sendEncryptedText(selectedRoom, `GIF:${gifUrl}`);
+      setShowGifPicker(false);
+      showToast('GIF отправлен', 'success');
+    } catch (e) {
+      showToast(apiErrorDetail(e, 'Не удалось отправить GIF'), 'error');
+    }
+  };
+
+  const sendEncryptedText = useCallback(
+    async (
+      room: Room,
+      text: string,
+      localId?: number,
+      replyToMessageId?: number
+    ): Promise<boolean> => {
     const isDirect = room.type === 'direct';
     const encrypted = isDirect
       ? await encryptForPeer(text, activePeerPublicKey as string)
@@ -1078,6 +1376,7 @@ export default function ChatPage() {
       nonce: encrypted.nonce,
       key_version: encrypted.key_version,
       sender_device_id: e2e.getDeviceId(),
+      reply_to_message_id: replyToMessageId,
     });
     const data = res.data as { id: number; content: string; nonce?: string; key_version?: number; timestamp?: string };
     setMsgList((prev) => {
@@ -1088,6 +1387,8 @@ export default function ChatPage() {
         room_id: room.id,
         sender_id: userId!,
         sender_nickname: 'Вы',
+        sender_is_admin: Boolean(isAdmin),
+        reply_to_message_id: replyToMessageId ?? null,
         content: text,
         nonce: data.nonce ?? encrypted.nonce,
         key_version: Number(data.key_version ?? encrypted.key_version),
@@ -1130,7 +1431,8 @@ export default function ChatPage() {
     }
     setIsSending(true);
     try {
-      await sendEncryptedText(room, text);
+      await sendEncryptedText(room, text, undefined, replyTo?.id);
+      setReplyTo(null);
     } catch (e: unknown) {
       const err = e as { response?: { status?: number } };
       if (err.response?.status === 429) {
@@ -1401,6 +1703,8 @@ export default function ChatPage() {
 
       if (!msgContextMenuRef.current?.contains(el)) setContextMenu(null);
       if (!roomSidebarContextMenuRef.current?.contains(el)) setRoomContextMenu(null);
+      if (!emojiPickerRef.current?.contains(el)) setShowEmojiPicker(false);
+      if (!gifPickerRef.current?.contains(el)) setShowGifPicker(false);
       if (
         !profileMenuRef.current?.contains(el) &&
         !profileButtonRef.current?.contains(el)
@@ -1542,6 +1846,9 @@ export default function ChatPage() {
   const profileLabel = profileNickname || (userId != null ? `User #${userId}` : 'Профиль');
   const profileUsernameLabel = profileUsername ? `@${profileUsername}` : '@unknown';
   const profileInitial = profileLabel[0]?.toUpperCase() || 'U';
+  const canManageRoles = myRole === 'super_admin';
+  const canManageUsers = canManageRoles || myPermissions.includes('manage_users');
+  const canBanUsers = canManageRoles || myPermissions.includes('ban_users');
 
   const copyProfileUsername = async () => {
     if (!profileUsername) return;
@@ -1554,16 +1861,22 @@ export default function ChatPage() {
   };
 
   return (
-    <div className="chat-page">
+    <div className={`chat-page ${isMobileView ? 'mobile' : ''} ${isMobileView && selectedRoom ? 'mobile-chat-open' : ''}`}>
       {/* Левый мини-сайдбар */}
+      {(!isMobileView || !selectedRoom) && (
       <div className="left-sidebar">
         <div className="server-icon active" title="MsgHub">M</div>
         <div className="separator"></div>
         <button className={`nav-btn ${activeMenu === 'chats' ? 'active' : ''}`} onClick={() => setActiveMenu('chats')} title="Чаты">💬</button>
         <button className={`nav-btn ${activeMenu === 'friends' ? 'active' : ''}`} onClick={() => setActiveMenu('friends')} title="Друзья">👥</button>
         <button className={`nav-btn ${activeMenu === 'requests' ? 'active' : ''}`} onClick={() => { setActiveMenu('requests'); loadFriendsData(); }} title="Заявки">
-          🔔{friendRequests.length > 0 && <span className="badge">{friendRequests.length}</span>}
+          🔔{friendRequests.length > 0 && <span className={`badge ${friendRequests.length > 0 ? 'pulse' : ''}`}>{friendRequests.length}</span>}
         </button>
+        {isAdmin && (
+          <button className={`nav-btn ${activeMenu === 'admin' ? 'active' : ''}`} onClick={() => setActiveMenu('admin')} title="Админ-панель">
+            🛡️
+          </button>
+        )}
         <div className="spacer"></div>
         <button className={`nav-btn ${activeMenu === 'settings' ? 'active' : ''}`} onClick={() => setActiveMenu('settings')} title="Настройки">⚙️</button>
         <button className="nav-btn logout-nav-btn" onClick={logout} title="Выйти">
@@ -1572,8 +1885,10 @@ export default function ChatPage() {
           </svg>
         </button>
       </div>
+      )}
 
       {/* Средний сайдбар */}
+      {(!isMobileView || !selectedRoom) && (
       <div className="middle-sidebar">
         <div className="sidebar-header">
           <button
@@ -1623,6 +1938,13 @@ export default function ChatPage() {
               <button className="create-room-btn" onClick={() => setShowCreateRoom(true)} title="Создать комнату">+</button>
             </div>
             <div className="room-list">
+              {roomsLoading && (
+                <>
+                  <div className="room-skeleton" />
+                  <div className="room-skeleton" />
+                  <div className="room-skeleton" />
+                </>
+              )}
               {filteredRooms.map((room) => {
                 const unread = unreadCounts[room.id] || 0;
                 const roomTitle = room.type === 'direct' && room.partner_id != null
@@ -1674,7 +1996,9 @@ export default function ChatPage() {
                   {friendList.map((f) => (
                     <div key={f.id} className="friend-item">
                       <div className="friend-info">
-                        <span className="friend-name">{f.nickname || f.username}</span>
+                        <span className="friend-name">
+                          {f.nickname || f.username} {adminBadge(f.is_admin)}
+                        </span>
                         <span className={`friend-status ${f.is_online ? 'online' : 'offline'}`}>
                           {f.is_online ? 'online' : 'offline'}
                         </span>
@@ -1684,6 +2008,37 @@ export default function ChatPage() {
                   ))}
                 </div>
               ) : <p className="empty-section">Нет друзей</p>}
+            </div>
+            <div className="friends-section">
+              <h4>ЧС ({blockedUsers.length})</h4>
+              {blockedUsers.length > 0 ? (
+                <div className="friend-list">
+                  {blockedUsers.map((f) => (
+                    <div key={f.id} className="friend-item">
+                      <div className="friend-info">
+                        <span className="friend-name">
+                          {f.nickname || f.username} {adminBadge(f.is_admin)}
+                        </span>
+                        <span className="friend-status offline">заблокирован</span>
+                      </div>
+                      <button
+                        className="msg-btn"
+                        onClick={async () => {
+                          try {
+                            await friends.unblock(f.id);
+                            await loadFriendsData();
+                            showToast('Пользователь разблокирован', 'success');
+                          } catch (e) {
+                            showToast(apiErrorDetail(e, 'Не удалось разблокировать'), 'error');
+                          }
+                        }}
+                      >
+                        ♻️
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : <p className="empty-section">Черный список пуст</p>}
             </div>
           </div>
         )}
@@ -1697,9 +2052,9 @@ export default function ChatPage() {
                   {friendRequests.map((req) => {
                     const displayName = req.nickname || req.username || `Пользователь #${req.partner_id || req.sender_id}`;
                     return (
-                      <div key={req.id} className="request-item">
+                      <div key={req.id} className={`request-item ${newRequestIds.has(Number(req.id)) ? 'request-item-new' : ''}`}>
                         <div className="request-info">
-                          <span className="request-name">{displayName}</span>
+                          <span className="request-name">{displayName} {adminBadge(req.is_admin)}</span>
                           <span className="request-status pending">{isMe(req.sender_id) ? 'Ожидает ответа' : 'Хочет добавить вас'}</span>
                         </div>
                         <div className="request-actions">
@@ -1820,18 +2175,14 @@ export default function ChatPage() {
             </div>
             {isAdmin && (
               <div className="settings-section">
-                <h4>Админ-панель (MVP)</h4>
-                {adminUsers.map((u) => (
-                  <div className="setting-item" key={u.id}>
-                    <span className="setting-label">#{u.id} {u.nickname} (@{u.username})</span>
-                    <div style={{ display: 'flex', gap: 8 }}>
-                      <button className="btn-secondary" onClick={() => auth.adminGrant(u.id)}>+admin</button>
-                      <button className="btn-secondary" onClick={() => auth.adminRevoke(u.id)}>-admin</button>
-                      <button className="btn-secondary" onClick={() => auth.adminBan(u.id)}>ban</button>
-                      <button className="btn-secondary" onClick={() => auth.adminUnban(u.id)}>unban</button>
-                    </div>
-                  </div>
-                ))}
+                <h4>Админ-раздел</h4>
+                <div className="setting-item">
+                  <span className="setting-label">Моя роль</span>
+                  <span className="setting-value">{myRole}</span>
+                </div>
+                <button className="btn-secondary" onClick={() => setActiveMenu('admin')}>
+                  Открыть отдельную админ-панель
+                </button>
               </div>
             )}
             <div className="settings-section app-settings-placeholder">
@@ -1857,7 +2208,133 @@ export default function ChatPage() {
             </button>
           </div>
         )}
+
+        {activeMenu === 'admin' && isAdmin && (
+          <div className="content-panel settings-panel">
+            <div className="settings-section">
+              <h4>Админ-панель</h4>
+              <div className="setting-item">
+                <span className="setting-label">Мои permissions</span>
+                <span className="setting-value">{myPermissions.join(', ') || 'нет'}</span>
+              </div>
+              <div className="setting-item">
+                <span className="setting-label">Моя роль</span>
+                <span className="setting-value">{myRole}</span>
+              </div>
+              <div className="setting-item">
+                <span className="setting-label">Режим</span>
+                <span className="setting-value">{canManageRoles ? 'SUPER_ADMIN' : 'MODERATOR'}</span>
+              </div>
+              {adminOverview && (
+                <>
+                  <div className="setting-item">
+                    <span className="setting-label">Всего пользователей</span>
+                    <span className="setting-value">{adminOverview.users_total}</span>
+                  </div>
+                  <div className="setting-item">
+                    <span className="setting-label">Забаненных</span>
+                    <span className="setting-value">{adminOverview.banned_total}</span>
+                  </div>
+                </>
+              )}
+            </div>
+            <div className="settings-section">
+              <h4>Пользователи</h4>
+              {!canManageRoles && (
+                <div className="setting-item">
+                  <span className="setting-label">Модераторский режим: доступны ban/unban, просмотр логов.</span>
+                </div>
+              )}
+              {adminUsers.map((u) => (
+                <div className="setting-item" key={`admin-panel-user-${u.id}`} style={{ alignItems: 'stretch', flexDirection: 'column' }}>
+                  <span className="setting-label">
+                    #{u.id} {u.nickname} (@{u.username}) {adminBadge(u.is_admin, u.role)} {u.profile_tag ? `· [${u.profile_tag}]` : ''}
+                  </span>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
+                    {canManageRoles && (
+                      <>
+                        <button className="btn-secondary" onClick={async () => { await auth.adminSetRole(u.id, 'user'); const r = await auth.adminListUsers(); setAdminUsers(r.data || []); }}>user</button>
+                        <button className="btn-secondary" onClick={async () => { await auth.adminSetRole(u.id, 'moderator'); const r = await auth.adminListUsers(); setAdminUsers(r.data || []); }}>moderator</button>
+                        <button className="btn-secondary" onClick={async () => { await auth.adminSetRole(u.id, 'super_admin'); const r = await auth.adminListUsers(); setAdminUsers(r.data || []); }}>super</button>
+                      </>
+                    )}
+                    {canBanUsers && (
+                      <>
+                        <button className="btn-secondary" onClick={async () => { await auth.adminBan(u.id); const r = await auth.adminListUsers(); setAdminUsers(r.data || []); }}>ban</button>
+                        <button className="btn-secondary" onClick={async () => { await auth.adminUnban(u.id); const r = await auth.adminListUsers(); setAdminUsers(r.data || []); }}>unban</button>
+                      </>
+                    )}
+                    {canManageUsers && (
+                      <>
+                        <button
+                          className="btn-secondary"
+                          onClick={async () => {
+                            try {
+                              const tag = (adminTagDraftByUser[u.id] ?? '').trim();
+                              await auth.adminSetUserTag(u.id, tag);
+                              const r = await auth.adminListUsers();
+                              setAdminUsers(r.data || []);
+                              showToast('Тег обновлен', 'success');
+                            } catch (e) {
+                              showToast(apiErrorDetail(e, 'Не удалось обновить тег'), 'error');
+                            }
+                          }}
+                        >
+                          сохранить тег
+                        </button>
+                        <button
+                          className="btn-secondary danger"
+                          onClick={async () => {
+                            if (!window.confirm(`Удалить аккаунт @${u.username}?`)) return;
+                            try {
+                              await auth.adminDeleteUser(u.id);
+                              const r = await auth.adminListUsers();
+                              setAdminUsers(r.data || []);
+                              showToast('Аккаунт удален', 'success');
+                            } catch (e) {
+                              showToast(apiErrorDetail(e, 'Не удалось удалить аккаунт'), 'error');
+                            }
+                          }}
+                        >
+                          удалить аккаунт
+                        </button>
+                      </>
+                    )}
+                  </div>
+                  {canManageUsers && (
+                    <input
+                      className="profile-input"
+                      placeholder="Тег пользователя"
+                      value={adminTagDraftByUser[u.id] ?? ''}
+                      onChange={(e) => setAdminTagDraftByUser((prev) => ({ ...prev, [u.id]: e.target.value }))}
+                      style={{ marginTop: 8 }}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="settings-section">
+              <h4>Audit log</h4>
+              {adminLogs.slice(0, 12).map((log) => (
+                <div className="setting-item" key={`admin-tab-alog-${log.id}`}>
+                  <span className="setting-label">
+                    {new Date(log.created_at).toLocaleString('ru-RU')} · {log.action}
+                  </span>
+                </div>
+              ))}
+              <h4 style={{ marginTop: 16 }}>Security events</h4>
+              {securityEvents.slice(0, 12).map((evt) => (
+                <div className="setting-item" key={`admin-tab-sevt-${evt.id}`}>
+                  <span className="setting-label">
+                    {new Date(evt.created_at).toLocaleString('ru-RU')} · {evt.event_type} · {evt.severity}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
+      )}
 
       {/* Правая часть — чат */}
       <div className="main-chat">
@@ -1865,6 +2342,11 @@ export default function ChatPage() {
           <>
             <div className="chat-header">
               <div className="header-left">
+                {isMobileView && (
+                  <button className="header-btn mobile-back-btn" onClick={() => setSelectedRoom(null)} title="Назад к списку">
+                    ←
+                  </button>
+                )}
                 <span className="chat-icon">{selectedRoom.type === 'direct' ? '👤' : '#'}</span>
                 <div className="header-info">
                   <h3>{selectedRoom.type === 'direct' ? getDirectRoomName(selectedRoom) : selectedRoom.name}</h3>
@@ -1884,6 +2366,25 @@ export default function ChatPage() {
                 <button className="header-btn" onClick={() => setShowRoomMenu(!showRoomMenu)} title="Опции">⋮</button>
               </div>
             </div>
+            {msgList.some((m) => m.is_pinned) && (
+              <div className="pinned-strip">
+                {msgList
+                  .filter((m) => m.is_pinned)
+                  .slice(0, 3)
+                  .map((m) => (
+                    <button
+                      key={`pin-${m.id}`}
+                      className="pinned-item"
+                      onClick={() => {
+                        const node = document.getElementById(`msg-${m.id}`);
+                        if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                      }}
+                    >
+                      📌 {String(m.content ?? '').slice(0, 80)}
+                    </button>
+                  ))}
+              </div>
+            )}
 
             {/* Меню управления комнатой */}
             {showRoomMenu && (
@@ -1933,10 +2434,18 @@ export default function ChatPage() {
                     <button className="room-menu-item" onClick={async () => {
                       await rooms.clearHistory(selectedRoom.id);
                       setMsgList([]);
-                      showToast('История очищена', 'success');
+                      showToast('Ваши сообщения очищены', 'success');
                       setShowRoomMenu(false);
                     }}>
-                      🗑 Очистить историю
+                      🗑 Очистить мои сообщения
+                    </button>
+                    <button className="room-menu-item danger" onClick={async () => {
+                      await rooms.clearHistory(selectedRoom.id);
+                      await blockPartnerAndRemoveChat(selectedRoom);
+                      showToast('Мои сообщения очищены, собеседник заблокирован', 'success');
+                      setShowRoomMenu(false);
+                    }}>
+                      🧹 Очистить мои + авто-блок
                     </button>
                     <button className="room-menu-item danger" onClick={async () => {
                       await rooms.deleteSelf(selectedRoom.id);
@@ -1962,9 +2471,41 @@ export default function ChatPage() {
                     <p className="room-menu-title">Участники</p>
                     {roomMembers.map(member => (
                       <div key={member.id} className="room-menu-member">
-                        <span>{member.nickname || member.username}</span>
+                        <span>{member.nickname || member.username} {adminBadge(member.is_admin)}</span>
                         {!isMe(member.id) && (
-                          <button className="kick-btn" onClick={() => kickUser(member.id)}>✕</button>
+                          <div style={{ display: 'flex', gap: 6 }}>
+                            <button
+                              className="kick-btn"
+                              title="Mute 10 минут"
+                              onClick={async () => {
+                                try {
+                                  await rooms.mute(selectedRoom.id, member.id, 10, 'timeout');
+                                  await loadRoomMembers(selectedRoom.id);
+                                  showToast('Пользователь в timeout на 10 минут', 'success');
+                                } catch (e) {
+                                  showToast(apiErrorDetail(e, 'Не удалось выдать timeout'), 'error');
+                                }
+                              }}
+                            >
+                              ⏳
+                            </button>
+                            <button
+                              className="kick-btn"
+                              title="Снять mute"
+                              onClick={async () => {
+                                try {
+                                  await rooms.unmute(selectedRoom.id, member.id);
+                                  await loadRoomMembers(selectedRoom.id);
+                                  showToast('Timeout снят', 'success');
+                                } catch (e) {
+                                  showToast(apiErrorDetail(e, 'Не удалось снять timeout'), 'error');
+                                }
+                              }}
+                            >
+                              🔈
+                            </button>
+                            <button className="kick-btn" onClick={() => kickUser(member.id)}>✕</button>
+                          </div>
                         )}
                       </div>
                     ))}
@@ -1976,8 +2517,13 @@ export default function ChatPage() {
             <div className="messages-list" ref={messagesListRef} onScroll={handleScroll}>
               {loadingMore && <div className="loading-indicator">Загрузка старых сообщений...</div>}
               
-              {msgList.map((msg) => (
-                <div key={msg.id} className={`message-container ${isMe(msg.sender_id) ? 'own' : ''}`}>
+              {msgList.map((msg) => {
+                const repliedTo =
+                  msg.reply_to_message_id != null
+                    ? msgList.find((item) => sameId(item.id, msg.reply_to_message_id ?? -1))
+                    : null;
+                return (
+                <div id={`msg-${msg.id}`} key={msg.id} className={`message-container ${isMe(msg.sender_id) ? 'own' : ''}`}>
                   <div className="message-avatar">👤</div>
                   <div className="message">
                     <div className="msg-header">
@@ -1985,11 +2531,50 @@ export default function ChatPage() {
                         {isMe(msg.sender_id)
                           ? 'Вы'
                           : preferAlias(Number(msg.sender_id), msg.sender_nickname || `User #${msg.sender_id}`)}
+                        {' '}
+                        {adminBadge(Boolean(msg.sender_is_admin))}
                       </span>
                       <span className="msg-time">
                         {new Date(msg.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}
                         {msg.is_edited && <span className="edited-badge"> (ред.)</span>}
+                        {msg.is_pinned && <span className="edited-badge"> 📌</span>}
                       </span>
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <button
+                          type="button"
+                          className="kick-btn"
+                          title="Ответить"
+                          onClick={() =>
+                            setReplyTo({
+                              id: Number(msg.id),
+                              sender_nickname: msg.sender_nickname,
+                              content: String(msg.content ?? ''),
+                            })
+                          }
+                        >
+                          ↩
+                        </button>
+                        {selectedRoom.type === 'group' && isOwner && (
+                          <button
+                            type="button"
+                            className="kick-btn"
+                            title={msg.is_pinned ? 'Открепить' : 'Закрепить'}
+                            onClick={async () => {
+                              try {
+                                if (msg.is_pinned) {
+                                  await messages.unpin(selectedRoom.id, Number(msg.id));
+                                } else {
+                                  await messages.pin(selectedRoom.id, Number(msg.id));
+                                }
+                              } catch (e) {
+                                showToast(apiErrorDetail(e, 'Не удалось изменить закреп'), 'error');
+                              }
+                            }}
+                          >
+                            📌
+                          </button>
+                        )}
+                      </div>
                     </div>
                     {editingMsg && sameId(editingMsg.id, msg.id) ? (
                       <div className="edit-input">
@@ -2030,9 +2615,29 @@ export default function ChatPage() {
                         onContextMenu={(e) => isMe(msg.sender_id) && handleContextMenu(e, msg.id)}
                         onDoubleClick={() => isMe(msg.sender_id) && setEditingMsg(msg)}
                       >
-                        <span className="msg-text">
-                          {msg.id < 0 ? `${msg.content} ⏳` : msg.content}
-                        </span>
+                        {repliedTo && (
+                          <div className="reply-preview">
+                            <strong>
+                              {isMe(repliedTo.sender_id)
+                                ? 'Вы'
+                                : (repliedTo.sender_nickname || `User #${repliedTo.sender_id}`)}
+                            </strong>
+                            <span>{String(repliedTo.content ?? '').slice(0, 120)}</span>
+                          </div>
+                        )}
+                        {String(msg.content ?? '').startsWith('GIF:') ? (
+                          <img
+                            src={String(msg.content).slice(4)}
+                            alt="gif"
+                            className="msg-gif"
+                            loading="lazy"
+                          />
+                        ) : (
+                          <span
+                            className="msg-text markdown-body"
+                            dangerouslySetInnerHTML={renderMarkdown(msg.id < 0 ? `${msg.content} ⏳` : String(msg.content ?? ''))}
+                          />
+                        )}
                         {/* Бейдж прочтения для своих сообщений */}
                         {isMe(msg.sender_id) && Number(msg.id) > 0 && (
                           <span className={`read-badge ${msg.is_read ? 'read' : 'sent'}`}>
@@ -2043,7 +2648,7 @@ export default function ChatPage() {
                     )}
                   </div>
                 </div>
-              ))}
+              )})}
               {msgList.length === 0 && <p className="empty-chat">Нет сообщений. Напишите первое!</p>}
               <div ref={messagesEnd} />
             </div>
@@ -2078,6 +2683,15 @@ export default function ChatPage() {
             )}
 
             <div className="message-input">
+              {replyTo && (
+                <div className="reply-composer">
+                  <div className="reply-composer-meta">
+                    Ответ на #{replyTo.id} {replyTo.sender_nickname ? `(${replyTo.sender_nickname})` : ''}
+                  </div>
+                  <div className="reply-composer-text">{replyTo.content.slice(0, 140)}</div>
+                  <button type="button" className="kick-btn" onClick={() => setReplyTo(null)}>✕</button>
+                </div>
+              )}
               {selectedRoom.type === 'direct' && !directHandshakeReady && (
                 <div style={{ color: '#f6c26a', fontSize: 12, paddingBottom: 6 }}>
                   {directHandshakeBusy
@@ -2092,18 +2706,49 @@ export default function ChatPage() {
                     : 'Ожидание ключа группы...'}
                 </div>
               )}
-              <input
-                type="text"
+              <textarea
                 placeholder="Написать сообщение..."
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && sendMsg()}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey && !isInputLimitExceeded) {
+                    e.preventDefault();
+                    void sendMsg();
+                  }
+                }}
                 maxLength={MAX_MESSAGE_CHARS}
                 disabled={
                   (selectedRoom.type === 'direct' && !directHandshakeReady) ||
                   (selectedRoom.type === 'group' && !groupHandshakeReady)
                 }
+                wrap="soft"
+                rows={3}
               />
+              <div className={`message-input-counter ${isInputLimitExceeded ? 'error' : ''}`}>
+                {input.length}/{MAX_MESSAGE_CHARS}
+              </div>
+              <button
+                type="button"
+                className="send-btn emoji-toggle-btn"
+                title="Эмодзи"
+                onClick={() => {
+                  setShowGifPicker(false);
+                  setShowEmojiPicker((v) => !v);
+                }}
+              >
+                😀
+              </button>
+              <button
+                type="button"
+                className="send-btn emoji-toggle-btn"
+                title="GIF (Tenor)"
+                onClick={() => {
+                  setShowEmojiPicker(false);
+                  setShowGifPicker((v) => !v);
+                }}
+              >
+                GIF
+              </button>
               <button
                 onClick={sendMsg}
                 className="send-btn"
@@ -2111,6 +2756,7 @@ export default function ChatPage() {
                   isSending ||
                   sendCooldown ||
                   !input.trim() ||
+                  isInputLimitExceeded ||
                   (selectedRoom.type === 'direct' && !directHandshakeReady) ||
                   (selectedRoom.type === 'group' && !groupHandshakeReady)
                 }
@@ -2118,6 +2764,44 @@ export default function ChatPage() {
               >
                 {isSending ? '⏳' : '➤'}
               </button>
+              {showEmojiPicker && (
+                <div className="emoji-picker" ref={emojiPickerRef}>
+                  {['😀','😁','😂','🤣','😊','😍','😘','😎','🤔','😴','😭','😡','👍','👎','🔥','❤️','💯','🎉'].map((emoji) => (
+                    <button
+                      key={emoji}
+                      type="button"
+                      className="emoji-item"
+                      onClick={() => appendEmoji(emoji)}
+                    >
+                      {emoji}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {showGifPicker && (
+                <div className="gif-picker" ref={gifPickerRef}>
+                  <input
+                    className="gif-search-input"
+                    placeholder="Найти GIF в Tenor..."
+                    value={gifQuery}
+                    onChange={(e) => setGifQuery(e.target.value)}
+                  />
+                  {gifLoading && <p className="gif-loading">Поиск GIF...</p>}
+                  <div className="gif-grid">
+                    {gifResults.map((gif) => (
+                      <button
+                        key={gif.id}
+                        type="button"
+                        className="gif-item"
+                        onClick={() => void sendGif(gif.url)}
+                        title={gif.title}
+                      >
+                        <img src={gif.previewUrl} alt={gif.title} loading="lazy" />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </>
         ) : (

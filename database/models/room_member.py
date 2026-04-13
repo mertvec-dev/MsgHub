@@ -28,5 +28,8 @@ class RoomMember(SQLModel, table=True):
     user_id: int = Field(foreign_key="users.id", index=True)
     joined_at: datetime = Field(default_factory=datetime.utcnow)
     status: MembershipStatus = Field(default=MembershipStatus.MEMBER, index=True)
+    muted_until: Optional[datetime] = Field(default=None, index=True)
+    muted_reason: Optional[str] = Field(default=None, max_length=255)
+    muted_by_user_id: Optional[int] = Field(default=None, foreign_key="users.id")
 
     __table_args__ = (UniqueConstraint("room_id", "user_id", name="unique_room_user"),) # для чтобы не было двух участников с одним и тем же room_id и user_id

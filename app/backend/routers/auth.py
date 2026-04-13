@@ -16,6 +16,13 @@ from app.backend.schemas.auth import (
     RevokeSessionResponse,
     ProfileResponse,
     ProfileUpdateRequest,
+    AdminOverviewResponse,
+    RoleUpdateRequest,
+    PermissionUpdateRequest,
+    AdminTagUpdateRequest,
+    PermissionsResponse,
+    AdminAuditLogResponse,
+    SecurityEventResponse,
 )
 from app.backend.schemas.e2e import (
     E2EKeyRequest,
@@ -24,10 +31,16 @@ from app.backend.schemas.e2e import (
     DevicePublicKeyResponse,
     PeerDeviceKeysResponse,
     PeerDeviceKeyItem,
+    DirectE2EReadinessResponse,
 )
 
 # Сервис аутентификации — вся бизнес-логика тут
 from app.backend.services.auth_service import auth_service
+from app.backend.services.realtime_bus import realtime_bus
+from app.backend.services.audit_log_service import audit_log_service
+from app.backend.services.auth.rbac import Permission
+from app.backend.services.friends_service import friends_service
+from app.backend.services.e2e_orchestrator import e2e_orchestrator
 
 # Получение user_id из JWT-токена
 from app.backend.utils.jwt_utils import get_current_user
@@ -161,6 +174,13 @@ async def login(request: Request, response: Response, data: LoginRequest):
         _set_auth_cookies(response, tokens)
         return _response_payload(tokens)
     except ValueError as e:
+        await audit_log_service.log_security_event(
+            event_type="suspicious_login",
+            severity="warning",
+            details=f"username={data.username}; reason={str(e)}",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent"),
+        )
         # 401 — неверный логин или пароль
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -265,6 +285,14 @@ async def revoke_other_sessions(request: Request, user_id: int = Depends(get_cur
     if not refresh_token:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Refresh токен отсутствует")
     revoked = await auth_service.revoke_all_except(user_id, refresh_token)
+    await audit_log_service.log_security_event(
+        event_type="revoke_other_sessions",
+        user_id=user_id,
+        severity="info",
+        details=f"revoked={revoked}",
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("User-Agent"),
+    )
     return RevokeSessionResponse(message=f"Завершено сессий: {revoked}")
 
 
@@ -350,6 +378,9 @@ async def upsert_device_public_key(
             device_name=data.device_name,
             device_type=data.device_type,
         )
+        peer_ids = await friends_service.get_accepted_peer_ids(user_id)
+        for peer_id in peer_ids:
+            await e2e_orchestrator.sync_direct_pair(user_id, int(peer_id), reason="device_key_updated")
         return DevicePublicKeyResponse(
             user_id=item.user_id,
             device_id=item.device_id,
@@ -384,6 +415,25 @@ async def get_peer_device_keys(peer_user_id: int, user_id: int = Depends(get_cur
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
 
+@router.get(
+    "/e2e/direct-readiness/{peer_user_id}",
+    response_model=DirectE2EReadinessResponse,
+    summary="Серверная готовность E2E для direct-чата",
+)
+async def get_direct_e2e_readiness(
+    peer_user_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    """
+    Возвращает проверенный backend-статус E2E readiness для direct-чата.
+    """
+    try:
+        data = await auth_service.get_direct_e2e_readiness(user_id, peer_user_id)
+        return DirectE2EReadinessResponse(**data)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
 @router.get("/admin/users", response_model=list[ProfileResponse], summary="Список пользователей (admin)")
 async def admin_list_users(user_id: int = Depends(get_current_user)):
     try:
@@ -394,45 +444,287 @@ async def admin_list_users(user_id: int = Depends(get_current_user)):
 
 
 @router.post("/admin/users/{target_user_id}/grant-admin", response_model=ProfileResponse, summary="Выдать admin")
-async def admin_grant(target_user_id: int, user_id: int = Depends(get_current_user)):
+async def admin_grant(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
     try:
         user = await auth_service.set_admin(user_id, target_user_id, True)
+        await audit_log_service.log_admin_action(
+            actor_user_id=user_id,
+            target_user_id=target_user_id,
+            action="grant_admin",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent"),
+        )
+        await realtime_bus.emit_personal_event(
+            user_id=target_user_id,
+            payload={"action": "role_changed", "role": getattr(user.role, "value", str(user.role))},
+        )
         return ProfileResponse.model_validate(user)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.post("/admin/users/{target_user_id}/revoke-admin", response_model=ProfileResponse, summary="Снять admin")
-async def admin_revoke(target_user_id: int, user_id: int = Depends(get_current_user)):
+async def admin_revoke(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
     try:
         user = await auth_service.set_admin(user_id, target_user_id, False)
+        await audit_log_service.log_admin_action(
+            actor_user_id=user_id,
+            target_user_id=target_user_id,
+            action="revoke_admin",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent"),
+        )
+        await realtime_bus.emit_personal_event(
+            user_id=target_user_id,
+            payload={"action": "role_changed", "role": getattr(user.role, "value", str(user.role))},
+        )
         return ProfileResponse.model_validate(user)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.post("/admin/users/{target_user_id}/ban", response_model=ProfileResponse, summary="Бан пользователя")
-async def admin_ban(target_user_id: int, user_id: int = Depends(get_current_user)):
+async def admin_ban(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
     try:
         user = await auth_service.set_ban(user_id, target_user_id, True)
+        await audit_log_service.log_admin_action(
+            actor_user_id=user_id,
+            target_user_id=target_user_id,
+            action="ban_user",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent"),
+        )
+        await realtime_bus.emit_personal_event(
+            user_id=target_user_id,
+            payload={"action": "user_banned"},
+        )
         return ProfileResponse.model_validate(user)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.post("/admin/users/{target_user_id}/unban", response_model=ProfileResponse, summary="Разбан пользователя")
-async def admin_unban(target_user_id: int, user_id: int = Depends(get_current_user)):
+async def admin_unban(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
     try:
         user = await auth_service.set_ban(user_id, target_user_id, False)
+        await audit_log_service.log_admin_action(
+            actor_user_id=user_id,
+            target_user_id=target_user_id,
+            action="unban_user",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent"),
+        )
+        await realtime_bus.emit_personal_event(
+            user_id=target_user_id,
+            payload={"action": "user_unbanned"},
+        )
         return ProfileResponse.model_validate(user)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.post("/admin/users/{target_user_id}/deactivate", response_model=ProfileResponse, summary="Деактивация аккаунта")
-async def admin_deactivate(target_user_id: int, user_id: int = Depends(get_current_user)):
+async def admin_deactivate(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
     try:
         user = await auth_service.set_active(user_id, target_user_id, False)
+        await audit_log_service.log_admin_action(
+            actor_user_id=user_id,
+            target_user_id=target_user_id,
+            action="deactivate_user",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent"),
+        )
+        await realtime_bus.emit_personal_event(
+            user_id=target_user_id,
+            payload={"action": "user_banned"},
+        )
         return ProfileResponse.model_validate(user)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.get("/admin/overview", response_model=AdminOverviewResponse, summary="Сводка для admin-панели")
+async def admin_overview(user_id: int = Depends(get_current_user)):
+    try:
+        data = await auth_service.get_admin_overview(user_id)
+        return AdminOverviewResponse(**data)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
+@router.post("/admin/users/{target_user_id}/role", response_model=ProfileResponse, summary="Назначить роль")
+async def admin_set_role(
+    request: Request,
+    target_user_id: int,
+    payload: RoleUpdateRequest,
+    user_id: int = Depends(get_current_user),
+):
+    try:
+        user = await auth_service.set_role(user_id, target_user_id, payload.role)
+        await audit_log_service.log_admin_action(
+            actor_user_id=user_id,
+            target_user_id=target_user_id,
+            action="set_role",
+            details=f"role={payload.role.value}",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent"),
+        )
+        await realtime_bus.emit_personal_event(
+            user_id=target_user_id,
+            payload={"action": "role_changed", "role": payload.role.value},
+        )
+        return ProfileResponse.model_validate(user)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/admin/users/{target_user_id}/permissions/grant", summary="Выдать permission")
+async def admin_grant_permission(
+    request: Request,
+    target_user_id: int,
+    payload: PermissionUpdateRequest,
+    user_id: int = Depends(get_current_user),
+):
+    try:
+        await auth_service.grant_permission(user_id, target_user_id, payload.permission)
+        await audit_log_service.log_admin_action(
+            actor_user_id=user_id,
+            target_user_id=target_user_id,
+            action="grant_permission",
+            details=payload.permission,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent"),
+        )
+        await realtime_bus.emit_personal_event(
+            user_id=target_user_id,
+            payload={"action": "role_changed"},
+        )
+        return {"message": "Permission выдан"}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/admin/users/{target_user_id}/permissions/revoke", summary="Забрать permission")
+async def admin_revoke_permission(
+    request: Request,
+    target_user_id: int,
+    payload: PermissionUpdateRequest,
+    user_id: int = Depends(get_current_user),
+):
+    try:
+        await auth_service.revoke_permission(user_id, target_user_id, payload.permission)
+        await audit_log_service.log_admin_action(
+            actor_user_id=user_id,
+            target_user_id=target_user_id,
+            action="revoke_permission",
+            details=payload.permission,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent"),
+        )
+        await realtime_bus.emit_personal_event(
+            user_id=target_user_id,
+            payload={"action": "role_changed"},
+        )
+        return {"message": "Permission отозван"}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/admin/users/{target_user_id}/tag", response_model=ProfileResponse, summary="Назначить/очистить тег пользователя")
+async def admin_set_user_tag(
+    request: Request,
+    target_user_id: int,
+    payload: AdminTagUpdateRequest,
+    user_id: int = Depends(get_current_user),
+):
+    try:
+        user = await auth_service.set_user_profile_tag(user_id, target_user_id, payload.profile_tag)
+        await audit_log_service.log_admin_action(
+            actor_user_id=user_id,
+            target_user_id=target_user_id,
+            action="set_profile_tag",
+            details=f"profile_tag={payload.profile_tag or ''}",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent"),
+        )
+        await realtime_bus.emit_personal_event(
+            user_id=target_user_id,
+            payload={"action": "role_changed"},
+        )
+        return ProfileResponse.model_validate(user)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.delete("/admin/users/{target_user_id}", summary="Удалить аккаунт пользователя")
+async def admin_delete_user(
+    request: Request,
+    target_user_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    try:
+        await auth_service.delete_user_account(user_id, target_user_id)
+        await audit_log_service.log_admin_action(
+            actor_user_id=user_id,
+            target_user_id=target_user_id,
+            action="delete_user",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent"),
+        )
+        await realtime_bus.emit_personal_event(
+            user_id=target_user_id,
+            payload={"action": "user_banned"},
+        )
+        return {"message": "Аккаунт удален"}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.get("/admin/me/permissions", response_model=PermissionsResponse, summary="Мои permissions")
+async def admin_me_permissions(user_id: int = Depends(get_current_user)):
+    permissions = sorted(list(await auth_service.get_effective_permissions(user_id)))
+    return PermissionsResponse(permissions=permissions)
+
+
+@router.get("/admin/audit-logs", response_model=list[AdminAuditLogResponse], summary="Audit log админки")
+async def admin_audit_logs(user_id: int = Depends(get_current_user), limit: int = 100):
+    try:
+        await auth_service.ensure_permission(user_id, Permission.VIEW_AUDIT_LOGS)
+        data = await audit_log_service.list_admin_audit_logs(limit=limit)
+        return [
+            AdminAuditLogResponse(
+                id=i.id,
+                actor_user_id=i.actor_user_id,
+                target_user_id=i.target_user_id,
+                action=i.action,
+                details=i.details,
+                ip_address=i.ip_address,
+                user_agent=i.user_agent,
+                created_at=i.created_at,
+            )
+            for i in data
+        ]
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
+@router.get("/admin/security-events", response_model=list[SecurityEventResponse], summary="Журнал безопасности")
+async def admin_security_events(user_id: int = Depends(get_current_user), limit: int = 100):
+    try:
+        await auth_service.ensure_permission(user_id, Permission.VIEW_AUDIT_LOGS)
+        data = await audit_log_service.list_security_events(limit=limit)
+        return [
+            SecurityEventResponse(
+                id=i.id,
+                user_id=i.user_id,
+                event_type=i.event_type,
+                severity=i.severity,
+                details=i.details,
+                ip_address=i.ip_address,
+                user_agent=i.user_agent,
+                created_at=i.created_at,
+            )
+            for i in data
+        ]
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))

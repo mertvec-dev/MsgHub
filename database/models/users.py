@@ -1,6 +1,13 @@
 from sqlmodel import SQLModel, Field
 from datetime import datetime
 from typing import Optional
+from enum import Enum
+
+
+class UserRole(str, Enum):
+    USER = "user"
+    MODERATOR = "moderator"
+    SUPER_ADMIN = "super_admin"
 
 class User(SQLModel, table=True):
     """
@@ -33,6 +40,7 @@ class User(SQLModel, table=True):
     status_message: Optional[str] = Field(default=None)
     profile_tag: Optional[str] = Field(default=None, max_length=32)
     
+    role: UserRole = Field(default=UserRole.USER, index=True)
     is_admin: bool = Field(default=False)
     is_banned: bool = Field(default=False, index=True)
     is_active: bool = Field(default=True, index=True)

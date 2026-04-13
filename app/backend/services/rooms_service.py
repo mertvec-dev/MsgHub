@@ -13,19 +13,20 @@
 # ИМПОРТЫ
 # ============================================================================
 from typing import List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlmodel import select
 from sqlalchemy import text
 
 from database.engine import db_engine
+from database.models.friendships import Friendship, FriendshipStatus
 from database.models.rooms import Room, RoomType
 from database.models.room_member import RoomMember, MembershipStatus
-from database.models.friendships import Friendship, FriendshipStatus
 from database.models.messages import Message
 from database.models.users import User
-from database.models.room_key_envelopes import RoomKeyEnvelope
 from app.backend.schemas.e2e import RoomKeyEnvelopeUpsertRequest
+from app.backend.services.rooms.direct_room_orchestrator import DirectRoomOrchestrator
+from app.backend.services.rooms.room_key_use_case import RoomKeyUseCase
 
 
 # ============================================================================
@@ -36,6 +37,11 @@ class RoomService:
     """
     Управление комнатами и участниками.
     """
+
+    def __init__(self) -> None:
+        # Разделяем сложные зоны на отдельные use-case модули.
+        self.direct_orchestrator = DirectRoomOrchestrator()
+        self.room_key_use_case = RoomKeyUseCase()
 
     # ==========================================================================
     # СОЗДАНИЕ КОМНАТЫ
@@ -96,77 +102,7 @@ class RoomService:
         его запись в room_members удалена. Но комната и записи второго участника
         остались. Вместо создания дубликата — восстанавливаем первого участника.
         """
-        async for session in db_engine.get_async_session():
-            # 1. Проверяем что они друзья
-            friend_res = await session.execute(
-                select(Friendship).where(
-                    Friendship.status == FriendshipStatus.ACCEPTED,
-                    (
-                        ((Friendship.sender_id == user_id) & (Friendship.receiver_id == target_user_id)) |
-                        ((Friendship.sender_id == target_user_id) & (Friendship.receiver_id == user_id))
-                    ),
-                )
-            )
-            if not friend_res.scalars().first():
-                raise ValueError("Можно создать чат только с другом")
-
-            # 2. Ищем комнату где ОБА участника (обычный случай)
-            my_rooms_res = await session.execute(
-                select(Room).join(RoomMember).where(
-                    Room.type == RoomType.DIRECT,
-                    RoomMember.user_id == user_id,
-                )
-            )
-
-            for room in my_rooms_res.scalars().all():
-                check = await session.execute(
-                    select(RoomMember).where(
-                        RoomMember.room_id == room.id,
-                        RoomMember.user_id == target_user_id,
-                    )
-                )
-                if check.scalars().first():
-                    return room  # Оба на месте — возвращаем
-
-            # 3. Ищем комнату где ВТОРОЙ участник (восстановление после удаления)
-            target_rooms_res = await session.execute(
-                select(Room).join(RoomMember).where(
-                    Room.type == RoomType.DIRECT,
-                    RoomMember.user_id == target_user_id,
-                )
-            )
-
-            for room in target_rooms_res.scalars().all():
-                self_check = await session.execute(
-                    select(RoomMember).where(
-                        RoomMember.room_id == room.id,
-                        RoomMember.user_id == user_id,
-                    )
-                )
-
-                if not self_check.scalars().first():
-                    # Восстанавливаем пользователя в чате
-                    session.add(RoomMember(
-                        room_id=room.id,
-                        user_id=user_id,
-                        status=MembershipStatus.MEMBER,
-                    ))
-                    await session.commit()
-                    await session.refresh(room)
-                    return room
-
-            # 4. Создаём новую комнату
-            room = Room(name=None, type=RoomType.DIRECT, created_by=user_id)
-            session.add(room)
-            await session.flush()
-
-            session.add_all([
-                RoomMember(room_id=room.id, user_id=user_id, status=MembershipStatus.MEMBER),
-                RoomMember(room_id=room.id, user_id=target_user_id, status=MembershipStatus.MEMBER),
-            ])
-            await session.commit()
-            await session.refresh(room)
-            return room
+        return await self.direct_orchestrator.create_or_restore(user_id, target_user_id)
 
     # ==========================================================================
     # ПРИГЛАШЕНИЕ
@@ -444,6 +380,60 @@ class RoomService:
             await session.commit()
             return True
 
+    async def mute_user(
+        self,
+        room_id: int,
+        user_id: int,
+        actor_id: int,
+        minutes: int,
+        reason: str | None = None,
+    ) -> bool:
+        """
+        Временный mute участника комнаты.
+        """
+        if minutes <= 0:
+            raise ValueError("minutes должен быть больше 0")
+        async for session in db_engine.get_async_session():
+            if not await self._check_rights(actor_id, room_id, session):
+                raise ValueError("Прав недостаточно")
+            res = await session.execute(
+                select(RoomMember).where(
+                    RoomMember.room_id == room_id,
+                    RoomMember.user_id == user_id,
+                )
+            )
+            member = res.scalars().first()
+            if not member:
+                raise ValueError("Пользователь не в комнате")
+            if member.status == MembershipStatus.OWNER:
+                raise ValueError("Нельзя выдать mute владельцу")
+            member.muted_until = datetime.utcnow() + timedelta(minutes=minutes)
+            member.muted_reason = reason
+            member.muted_by_user_id = actor_id
+            session.add(member)
+            await session.commit()
+            return True
+
+    async def unmute_user(self, room_id: int, user_id: int, actor_id: int) -> bool:
+        async for session in db_engine.get_async_session():
+            if not await self._check_rights(actor_id, room_id, session):
+                raise ValueError("Прав недостаточно")
+            res = await session.execute(
+                select(RoomMember).where(
+                    RoomMember.room_id == room_id,
+                    RoomMember.user_id == user_id,
+                )
+            )
+            member = res.scalars().first()
+            if not member:
+                raise ValueError("Пользователь не в комнате")
+            member.muted_until = None
+            member.muted_reason = None
+            member.muted_by_user_id = None
+            session.add(member)
+            await session.commit()
+            return True
+
     # ==========================================================================
     # СПИСОК КОМНАТ С ПРЕВЬЮ
     # ==========================================================================
@@ -522,6 +512,29 @@ class RoomService:
 
             return result_data
 
+    async def get_room_members(self, room_id: int) -> List[Dict[str, Any]]:
+        """
+        Возвращает список участников комнаты для UI.
+        """
+        async for session in db_engine.get_async_session():
+            result = await session.execute(
+                select(User)
+                .join(RoomMember, User.id == RoomMember.user_id)
+                .where(RoomMember.room_id == room_id)
+            )
+            members = result.scalars().all()
+            return [
+                {
+                    "id": member.id,
+                    "nickname": member.nickname,
+                    "username": member.username,
+                    "is_admin": bool(member.is_admin),
+                    "muted_until": getattr(member, "muted_until", None),
+                    "muted_reason": getattr(member, "muted_reason", None),
+                }
+                for member in members
+            ]
+
     # ==========================================================================
     # ПРОВЕРКА ПРАВ (ВНУТРЕННИЙ МЕТОД)
     # ==========================================================================
@@ -549,143 +562,18 @@ class RoomService:
         """
         Пакетно сохраняет/обновляет конверты room key для указанной версии ключа.
         """
-        async for session in db_engine.get_async_session():
-            # 1) Текущий пользователь должен быть участником комнаты.
-            res = await session.execute(
-                select(RoomMember).where(
-                    RoomMember.room_id == room_id,
-                    RoomMember.user_id == user_id,
-                    RoomMember.status != MembershipStatus.BANNED,
-                    )
-                )
-            member = res.scalars().first()
-            if not member:
-                raise ValueError("Вы не являетесь участником комнаты")
-
-            # 2) Комната должна существовать.
-            room_res = await session.execute(select(Room).where(Room.id == room_id))
-            room = room_res.scalars().first()
-            if not room:
-                raise ValueError("Комната не найдена")
-
-            # 3) Версия ключа не может быть старее/новее текущей (ротация отдельным шагом).
-            if request.key_version < room.current_key_version:
-                raise ValueError("Указана устаревшая версия ключа")
-            if request.key_version > room.current_key_version:
-                raise ValueError("Сначала выполните ротацию ключа комнаты")
-
-            upserted = 0
-
-            # 4) Upsert для каждого конверта из запроса.
-            for item in request.envelopes:
-                target_member_res = await session.execute(
-                    select(RoomMember).where(
-                        RoomMember.room_id == room_id,
-                        RoomMember.user_id == item.user_id,
-                        RoomMember.status != MembershipStatus.BANNED,
-                    )
-                )
-                target_member = target_member_res.scalars().first()
-                if not target_member:
-                    raise ValueError(f"Пользователь {item.user_id} не является участником комнаты")
-
-                env_res = await session.execute(
-                    select(RoomKeyEnvelope).where(
-                        RoomKeyEnvelope.room_id == room_id,
-                        RoomKeyEnvelope.user_id == item.user_id,
-                        RoomKeyEnvelope.key_version == request.key_version,
-                    )
-                )
-                envelope = env_res.scalars().first()
-
-                if envelope:
-                    envelope.encrypted_key = item.encrypted_key
-                    envelope.algorithm = item.algorithm
-                    envelope.updated_at = datetime.utcnow()
-                else:
-                    envelope = RoomKeyEnvelope(
-                        room_id=room_id,
-                        user_id=item.user_id,
-                        key_version=request.key_version,
-                        encrypted_key=item.encrypted_key,
-                        algorithm=item.algorithm,
-                    )
-                    session.add(envelope)
-                upserted += 1
-
-            await session.commit()
-            return {
-                "room_id": room_id,
-                "key_version": request.key_version,
-                "upserted": upserted,
-            }
+        return await self.room_key_use_case.upsert(room_id, user_id, request)
 
     async def get_room_key(self, room_id: int, user_id: int) -> dict:
         """
         Получает конверт с публичным ключом E2E для шифрования сообщений в комнате.
         """
-        async for session in db_engine.get_async_session():
-            # 1) Текущий пользователь должен быть участником комнаты.
-            res = await session.execute(
-                select(RoomMember).where(
-                    RoomMember.room_id == room_id,
-                    RoomMember.user_id == user_id,
-                    RoomMember.status != MembershipStatus.BANNED,
-                    )
-                )
-            member = res.scalars().first()
-            if not member:
-                raise ValueError("Вы не являетесь участником комнаты")
-
-            # 2) Комната должна существовать.
-            room_res = await session.execute(select(Room).where(Room.id == room_id))
-            room = room_res.scalars().first()
-            if not room:
-                raise ValueError("Комната не найдена")
-            
-            env_res = await session.execute(
-                    select(RoomKeyEnvelope).where(
-                        RoomKeyEnvelope.room_id == room_id,
-                        RoomKeyEnvelope.user_id == user_id,
-                        RoomKeyEnvelope.key_version == room.current_key_version,
-                    )
-                )
-            envelope = env_res.scalars().first()
-            if not envelope:
-                raise ValueError("Конверт не найден")
-            return {
-                "room_id": room_id,
-                "user_id": user_id,
-                "key_version": room.current_key_version,
-                "encrypted_key": envelope.encrypted_key,
-                "algorithm": envelope.algorithm,
-            }
+        return await self.room_key_use_case.get_my_key(room_id, user_id)
 
     async def rotate_room_key(self, room_id: int, user_id: int) -> dict:
         """
         Вращает (меняет версию) ключ в конверте с публичным ключом E2E для шифрования сообщений в комнате.
         """
-        async for session in db_engine.get_async_session():
-            # 1) Пользователь должен иметь права администратора или владельца комнаты.
-            if not await self._check_rights(user_id, room_id, session):
-                raise ValueError("Прав недостаточно")
-            
-            # 2) Комната должна существовать.
-            room_res = await session.execute(select(Room).where(Room.id == room_id))
-            room = room_res.scalars().first()
-            if not room:
-                raise ValueError("Комната не найдена")
-            
-            # 3) Вращаем ключ.
-            room_id_value = room.id
-            new_key_version = room.current_key_version + 1
-            room.current_key_version = new_key_version
-            session.add(room)
-            await session.commit()
-            # Сервис возвращает plain dict; Pydantic-обертка создается в роутере.
-            return {
-                "room_id": room_id_value,
-                "current_key_version": new_key_version,
-            }
+        return await self.room_key_use_case.rotate(room_id, user_id, self._check_rights)
 # Глобальный экземпляр
 room_service = RoomService()

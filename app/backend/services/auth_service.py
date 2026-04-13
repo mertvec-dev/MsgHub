@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete as sql_delete
 from sqlmodel import select
 
 from app.backend.config import settings
@@ -12,17 +13,31 @@ from app.backend.utils.jwt_utils import create_access_token
 from app.backend.utils.password_validator import hash_password, validate_password, verify_password
 from database.engine import db_engine
 from database.models.devices import Device
-from database.models.friendships import Friendship, FriendshipStatus
+from database.models.friendships import Friendship
 from database.models.room_member import RoomMember
+from database.models.messages import Message
 from database.models.sessions import Session as SessionModel
-from database.models.users import User
+from database.models.users import User, UserRole
 from database.models.users_public_key import UserPublicKey
 from database.redis import redis_client
+from app.backend.services.auth.admin_service import AdminService
+from app.backend.services.auth.device_keys_service import DeviceKeysService
+from app.backend.services.auth.profile_service import ProfileService
+from app.backend.services.auth.sessions_service import SessionsService
+from app.backend.services.auth.rbac import Permission, has_permission
+from app.backend.services.audit_log_service import audit_log_service
 
 logger = logging.getLogger(__name__)
 
 
 class AuthService:
+    def __init__(self) -> None:
+        # Декомпозиция "толстого" auth-сервиса на прикладные зоны.
+        self.admin_service = AdminService()
+        self.device_keys_service = DeviceKeysService()
+        self.profile_service = ProfileService()
+        self.sessions_service = SessionsService()
+
     @staticmethod
     def _token_hash(refresh_token: str) -> str:
         return hashlib.sha256(refresh_token.encode()).hexdigest()
@@ -68,6 +83,24 @@ class AuthService:
         session.add(device)
         return device
 
+    async def _sanitize_new_user_state(self, session: AsyncSession, user_id: int) -> None:
+        """
+        Защитная очистка следов для нового user_id.
+
+        Нужна как fail-safe на случай неконсистентной БД/ручных миграций:
+        новый аккаунт не должен «унаследовать» старые дружбы, комнаты и ключи.
+        """
+        await session.execute(
+            sql_delete(Friendship).where(
+                (Friendship.sender_id == user_id) | (Friendship.receiver_id == user_id)
+            )
+        )
+        await session.execute(sql_delete(RoomMember).where(RoomMember.user_id == user_id))
+        await session.execute(sql_delete(Message).where(Message.sender_id == user_id))
+        await session.execute(sql_delete(SessionModel).where(SessionModel.user_id == user_id))
+        await session.execute(sql_delete(Device).where(Device.user_id == user_id))
+        await session.execute(sql_delete(UserPublicKey).where(UserPublicKey.user_id == user_id))
+
     async def register(
         self,
         nickname: str,
@@ -82,6 +115,8 @@ class AuthService:
             raise ValueError("Слабый пароль")
 
         async with AsyncSession(db_engine.engine) as session:
+            users_count_res = await session.execute(select(User.id))
+            is_first_user = users_count_res.first() is None
             for condition, msg in (
                 (User.nickname == nickname, "Nickname уже занят"),
                 (User.username == username, "Username уже занят"),
@@ -90,10 +125,17 @@ class AuthService:
                 if res.scalars().first():
                     raise ValueError(msg)
 
-            user = User(nickname=nickname, username=username, password_hash=hash_password(password))
+            user = User(
+                nickname=nickname,
+                username=username,
+                password_hash=hash_password(password),
+                role=UserRole.SUPER_ADMIN if is_first_user else UserRole.USER,
+                is_admin=is_first_user,
+            )
             session.add(user)
             await session.flush()
             user_id = int(user.id)
+            await self._sanitize_new_user_state(session, user_id)
 
             await self._upsert_device(session, user_id, device_id, device_name, device_type)
 
@@ -142,6 +184,15 @@ class AuthService:
                 raise ValueError("Аккаунт заблокирован")
 
             user_id = int(user.id)
+            is_new_device = False
+            if device_id:
+                existing_device = await session.execute(
+                    select(Device.id).where(
+                        Device.user_id == user_id,
+                        Device.device_id == device_id,
+                    )
+                )
+                is_new_device = existing_device.first() is None
             await self._upsert_device(session, user_id, device_id, device_name, device_type)
 
             refresh_token = secrets.token_urlsafe(32)
@@ -159,6 +210,15 @@ class AuthService:
             )
             await session.commit()
             await self._cache_session(refresh_token_hash, user_id)
+            if is_new_device:
+                await audit_log_service.log_security_event(
+                    event_type="new_device_login",
+                    user_id=user_id,
+                    severity="warning",
+                    details=f"Новое устройство: {device_name}",
+                    ip_address=ip_address,
+                    user_agent=device_name,
+                )
 
             access_token = create_access_token(
                 data={"user_id": user_id},
@@ -172,141 +232,27 @@ class AuthService:
             }
 
     async def refresh(self, refresh_token: str) -> dict:
-        token_hash = self._token_hash(refresh_token)
-        async with AsyncSession(db_engine.engine) as session:
-            res = await session.execute(
-                select(SessionModel).where(
-                    SessionModel.refresh_token_hash == token_hash,
-                    SessionModel.expires_at > datetime.utcnow(),
-                )
-            )
-            db_session = res.scalars().first()
-            if not db_session:
-                raise ValueError("Сессия недействительна")
-
-            user_id = int(db_session.user_id)
-            old_device_id = db_session.device_id
-            old_device_info = db_session.device_info
-            old_ip = db_session.ip_address
-            await session.delete(db_session)
-
-            new_refresh = secrets.token_urlsafe(32)
-            new_hash = self._token_hash(new_refresh)
-            session.add(
-                SessionModel(
-                    user_id=user_id,
-                    refresh_token_hash=new_hash,
-                    device_id=old_device_id,
-                    device_info=old_device_info,
-                    ip_address=old_ip,
-                    expires_at=datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
-                )
-            )
-            await session.commit()
-            await self._cache_session(new_hash, user_id)
-            try:
-                await redis_client.delete(f"session:{token_hash}")
-            except Exception:
-                pass
-
-            access_token = create_access_token(
-                data={"user_id": user_id},
-                expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
-            )
-            return {
-                "access_token": access_token,
-                "refresh_token": new_refresh,
-                "token_type": "bearer",
-                "user_id": user_id,
-            }
+        return await self.sessions_service.refresh(refresh_token)
 
     async def logout(self, refresh_token: str) -> bool:
-        token_hash = self._token_hash(refresh_token)
-        try:
-            await redis_client.delete(f"session:{token_hash}")
-        except Exception:
-            pass
-
-        async with AsyncSession(db_engine.engine) as session:
-            res = await session.execute(
-                select(SessionModel).where(SessionModel.refresh_token_hash == token_hash)
-            )
-            db_session = res.scalars().first()
-            if not db_session:
-                return False
-            await session.delete(db_session)
-            await session.commit()
-            return True
+        return await self.sessions_service.logout(refresh_token)
 
     async def get_sessions(self, user_id: int) -> list[SessionModel]:
-        async with AsyncSession(db_engine.engine) as session:
-            res = await session.execute(
-                select(SessionModel)
-                .where(
-                    SessionModel.user_id == user_id,
-                    SessionModel.expires_at > datetime.utcnow(),
-                )
-                .order_by(SessionModel.last_active_at.desc())
-            )
-            return list(res.scalars().all())
+        return await self.sessions_service.list_active(user_id)
 
     async def revoke_session(self, user_id: int, session_id: int) -> bool:
-        async with AsyncSession(db_engine.engine) as session:
-            res = await session.execute(
-                select(SessionModel).where(
-                    SessionModel.id == session_id,
-                    SessionModel.user_id == user_id,
-                )
-            )
-            item = res.scalars().first()
-            if not item:
-                return False
-            await redis_client.delete(f"session:{item.refresh_token_hash}")
-            await session.delete(item)
-            await session.commit()
-            return True
+        return await self.sessions_service.revoke_one(user_id, session_id)
 
     async def revoke_all_except(self, user_id: int, current_refresh_token: str) -> int:
-        keep_hash = self._token_hash(current_refresh_token)
-        async with AsyncSession(db_engine.engine) as session:
-            res = await session.execute(
-                select(SessionModel).where(
-                    SessionModel.user_id == user_id,
-                    SessionModel.refresh_token_hash != keep_hash,
-                )
-            )
-            items = list(res.scalars().all())
-            for item in items:
-                try:
-                    await redis_client.delete(f"session:{item.refresh_token_hash}")
-                except Exception:
-                    pass
-                await session.delete(item)
-            await session.commit()
-            return len(items)
+        return await self.sessions_service.revoke_all_except(
+            user_id, current_refresh_token
+        )
 
     async def get_me(self, user_id: int) -> User:
-        async with AsyncSession(db_engine.engine) as session:
-            res = await session.execute(select(User).where(User.id == user_id))
-            user = res.scalars().first()
-            if not user:
-                raise ValueError("Пользователь не найден")
-            return user
+        return await self.profile_service.get_me(user_id)
 
     async def update_me(self, user_id: int, payload: dict) -> User:
-        async with AsyncSession(db_engine.engine) as session:
-            res = await session.execute(select(User).where(User.id == user_id))
-            user = res.scalars().first()
-            if not user:
-                raise ValueError("Пользователь не найден")
-            for key in ("nickname", "email", "avatar_url", "status_message", "profile_tag"):
-                if key in payload and payload[key] is not None:
-                    setattr(user, key, payload[key])
-            user.updated_at = datetime.utcnow()
-            session.add(user)
-            await session.commit()
-            await session.refresh(user)
-            return user
+        return await self.profile_service.update_me(user_id, payload)
 
     async def upsert_device_public_key(
         self,
@@ -317,48 +263,30 @@ class AuthService:
         device_name: Optional[str] = None,
         device_type: Optional[str] = None,
     ) -> Device:
-        async with AsyncSession(db_engine.engine) as session:
-            device = await self._upsert_device(session, user_id, device_id, device_name, device_type)
-            if device is None:
-                raise ValueError("device_id обязателен")
-            device.public_key = public_key
-            device.key_algorithm = algorithm
-            device.key_updated_at = datetime.utcnow()
-            session.add(device)
-            await session.commit()
-            await session.refresh(device)
-            return device
+        return await self.device_keys_service.upsert_device_key(
+            user_id=user_id,
+            device_id=device_id,
+            public_key=public_key,
+            algorithm=algorithm,
+            device_name=device_name,
+            device_type=device_type,
+            upsert_device_cb=self._upsert_device,
+        )
 
     async def get_peer_device_keys(self, viewer_id: int, peer_user_id: int) -> list[Device]:
-        async with AsyncSession(db_engine.engine) as session:
-            friend_res = await session.execute(
-                select(Friendship).where(
-                    Friendship.status == FriendshipStatus.ACCEPTED,
-                    (
-                        ((Friendship.sender_id == viewer_id) & (Friendship.receiver_id == peer_user_id))
-                        | ((Friendship.sender_id == peer_user_id) & (Friendship.receiver_id == viewer_id))
-                    ),
-                )
-            )
-            if not friend_res.scalars().first() and viewer_id != peer_user_id:
-                shared_room = await session.execute(
-                    select(RoomMember).where(RoomMember.user_id == viewer_id)
-                )
-                my_rooms = {r.room_id for r in shared_room.scalars().all()}
-                peer_room = await session.execute(select(RoomMember).where(RoomMember.user_id == peer_user_id))
-                peer_rooms = {r.room_id for r in peer_room.scalars().all()}
-                if not (my_rooms & peer_rooms):
-                    raise ValueError("Недостаточно прав для просмотра ключей устройства")
+        return await self.device_keys_service.get_peer_keys(viewer_id, peer_user_id)
 
-            res = await session.execute(
-                select(Device).where(
-                    Device.user_id == peer_user_id,
-                    Device.public_key.is_not(None),
-                )
-            )
-            return list(res.scalars().all())
+    async def get_direct_e2e_readiness(self, viewer_id: int, peer_user_id: int) -> dict:
+        """
+        Серверная проверка готовности E2E для direct-чата.
 
-    # Legacy compatibility.
+        Используется для подтверждения readiness на backend, а не на клиенте.
+        """
+        return await self.device_keys_service.get_direct_e2e_readiness(
+            viewer_id, peer_user_id
+        )
+
+    # Обратная совместимость: старый single-key endpoint.
     async def upsert_public_key(self, user_id: int, public_key: str, algorithm: str = "p256-ecdh-v1") -> UserPublicKey:
         async with AsyncSession(db_engine.engine) as session:
             result = await session.execute(select(UserPublicKey).where(UserPublicKey.user_id == user_id))
@@ -394,60 +322,64 @@ class AuthService:
             return user_public_key
 
     async def list_users_admin(self, actor_user_id: int) -> list[User]:
-        actor = await self.get_me(actor_user_id)
-        if not actor.is_admin:
-            raise ValueError("Недостаточно прав")
-        async with AsyncSession(db_engine.engine) as session:
-            res = await session.execute(select(User).order_by(User.id.asc()))
-            return list(res.scalars().all())
+        await self._require_permission(actor_user_id, Permission.MANAGE_USERS)
+        return await self.admin_service.list_users()
 
     async def set_admin(self, actor_user_id: int, target_user_id: int, value: bool) -> User:
-        actor = await self.get_me(actor_user_id)
-        if not actor.is_admin:
-            raise ValueError("Недостаточно прав")
-        async with AsyncSession(db_engine.engine) as session:
-            res = await session.execute(select(User).where(User.id == target_user_id))
-            user = res.scalars().first()
-            if not user:
-                raise ValueError("Пользователь не найден")
-            user.is_admin = value
-            session.add(user)
-            await session.commit()
-            await session.refresh(user)
-            return user
+        await self._require_super_admin(actor_user_id)
+        return await self.admin_service.set_admin_flag(target_user_id, value)
 
     async def set_ban(self, actor_user_id: int, target_user_id: int, value: bool) -> User:
-        actor = await self.get_me(actor_user_id)
-        if not actor.is_admin:
-            raise ValueError("Недостаточно прав")
-        async with AsyncSession(db_engine.engine) as session:
-            res = await session.execute(select(User).where(User.id == target_user_id))
-            user = res.scalars().first()
-            if not user:
-                raise ValueError("Пользователь не найден")
-            user.is_banned = value
-            user.is_active = not value
-            session.add(user)
-            await session.commit()
-            await session.refresh(user)
-            return user
+        await self._require_permission(actor_user_id, Permission.BAN_USERS)
+        return await self.admin_service.set_ban_flag(target_user_id, value)
 
     async def set_active(self, actor_user_id: int, target_user_id: int, value: bool) -> User:
+        await self._require_permission(actor_user_id, Permission.MANAGE_USERS)
+        return await self.admin_service.set_active_flag(target_user_id, value)
+
+    async def get_admin_overview(self, actor_user_id: int) -> dict:
+        await self._require_permission(actor_user_id, Permission.VIEW_AUDIT_LOGS)
+        return await self.admin_service.get_overview()
+
+    async def set_role(self, actor_user_id: int, target_user_id: int, role: UserRole) -> User:
+        await self._require_super_admin(actor_user_id)
+        return await self.admin_service.set_role(target_user_id, role)
+
+    async def grant_permission(self, actor_user_id: int, target_user_id: int, permission: str) -> None:
+        await self._require_super_admin(actor_user_id)
+        await self.admin_service.grant_permission(target_user_id, permission)
+
+    async def revoke_permission(self, actor_user_id: int, target_user_id: int, permission: str) -> None:
+        await self._require_super_admin(actor_user_id)
+        await self.admin_service.revoke_permission(target_user_id, permission)
+
+    async def set_user_profile_tag(self, actor_user_id: int, target_user_id: int, profile_tag: str | None) -> User:
+        await self._require_permission(actor_user_id, Permission.MANAGE_USERS)
+        return await self.admin_service.set_profile_tag(target_user_id, profile_tag)
+
+    async def delete_user_account(self, actor_user_id: int, target_user_id: int) -> None:
+        await self._require_permission(actor_user_id, Permission.MANAGE_USERS)
+        if int(actor_user_id) == int(target_user_id):
+            raise ValueError("Нельзя удалить собственный аккаунт через админ-панель")
+        await self.admin_service.delete_user_account(target_user_id)
+
+    async def get_effective_permissions(self, actor_user_id: int) -> set[str]:
+        return await self.admin_service.get_user_effective_permissions(actor_user_id)
+
+    async def _require_permission(self, actor_user_id: int, permission: str) -> None:
         actor = await self.get_me(actor_user_id)
-        if not actor.is_admin:
+        role = actor.role.value if hasattr(actor.role, "value") else str(actor.role)
+        extra = await self.admin_service.get_user_extra_permissions(actor_user_id)
+        if not has_permission(role, permission, extra):
             raise ValueError("Недостаточно прав")
-        async with AsyncSession(db_engine.engine) as session:
-            res = await session.execute(select(User).where(User.id == target_user_id))
-            user = res.scalars().first()
-            if not user:
-                raise ValueError("Пользователь не найден")
-            user.is_active = value
-            if not value:
-                user.is_banned = True
-            session.add(user)
-            await session.commit()
-            await session.refresh(user)
-            return user
+
+    async def ensure_permission(self, actor_user_id: int, permission: str) -> None:
+        await self._require_permission(actor_user_id, permission)
+
+    async def _require_super_admin(self, actor_user_id: int) -> None:
+        actor = await self.get_me(actor_user_id)
+        if actor.role != UserRole.SUPER_ADMIN:
+            raise ValueError("Только SUPER_ADMIN может управлять ролями и правами")
 
 
 auth_service = AuthService()

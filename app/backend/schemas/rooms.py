@@ -63,3 +63,9 @@ class RoomMembersList(BaseModel):
 class InviteUserRequest(BaseModel):
     """Пригласить пользователя"""
     user_id: int
+
+
+class RoomMuteRequest(BaseModel):
+    user_id: int
+    minutes: int = Field(..., ge=1, le=24 * 60)
+    reason: Optional[str] = Field(default=None, max_length=255)

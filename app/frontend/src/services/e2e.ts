@@ -1,3 +1,5 @@
+import { randomNonce } from '../chat/utils/crypto';
+
 const KEY_ALIAS = 'msghub-e2e-p256-private-jwk-v1';
 const ROOM_KEY_PREFIX = 'msghub-e2e-room-key-v1';
 const PEER_DERIVED_CACHE_PREFIX = 'msghub-peer-derived-cache-v1';
@@ -24,15 +26,6 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes.buffer;
-}
-
-function randomNonce(length = 12): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  const bytes = new Uint8Array(length);
-  crypto.getRandomValues(bytes);
-  let out = '';
-  for (let i = 0; i < bytes.length; i++) out += alphabet[bytes[i] % alphabet.length];
-  return out;
 }
 
 async function importOwnPrivateKey(): Promise<CryptoKey | null> {

@@ -3,7 +3,6 @@
 
 Отвечает за:
   - Проверку членства в комнате
-  - Шифрование контента (Fernet)
   - Сохранение в БД с обновлением активности комнаты
   - Cursor-based пагинацию (скролл в историю)
   - Проверку прав при редактировании
@@ -23,6 +22,7 @@ from database.engine import db_engine
 from database.models.messages import Message
 from database.models.message_reads import MessageRead
 from database.models.devices import Device
+from database.models.friendships import Friendship, FriendshipStatus
 from database.models.rooms import Room
 from database.models.room_member import RoomMember, MembershipStatus
 from database.models.room_key_envelopes import RoomKeyEnvelope
@@ -50,6 +50,7 @@ class MessageService:
         nonce: str,
         key_version: Optional[int] = None,
         sender_device_id: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
     ) -> Message:
         """
         Создаёт новое сообщение в комнате.
@@ -81,6 +82,14 @@ class MessageService:
                 raise ValueError("Вы не являетесь участником этой комнаты")
 
             _member, room = row
+            if (
+                room.type == "group"
+                and getattr(_member, "muted_until", None) is not None
+                and _member.muted_until > datetime.utcnow()
+            ):
+                raise ValueError("Вы временно не можете писать в эту группу (muted)")
+            if room.type == "direct":
+                await self._ensure_direct_not_blocked(session, room.id, sender_id)
             await self._ensure_e2e_ready_for_send(
                 session=session,
                 room=room,
@@ -88,6 +97,15 @@ class MessageService:
                 sender_device_id=sender_device_id,
                 key_version=key_version,
             )
+            if reply_to_message_id is not None:
+                reply_res = await session.execute(
+                    select(Message.id).where(
+                        Message.id == int(reply_to_message_id),
+                        Message.room_id == room_id,
+                    )
+                )
+                if not reply_res.scalar():
+                    raise ValueError("Сообщение для ответа не найдено в этой комнате")
 
             # 3. Создаём сообщение
             message = Message(
@@ -97,6 +115,7 @@ class MessageService:
                 content=content,  # ciphertext
                 nonce=nonce,
                 key_version=key_version or getattr(room, "current_key_version", 1) or 1,
+                reply_to_message_id=reply_to_message_id,
             )
             session.add(message)
 
@@ -171,6 +190,35 @@ class MessageService:
             if not envelope_res.scalars().first():
                 raise ValueError("E2E не готово: отсутствует конверт ключа комнаты для отправителя")
 
+    async def _ensure_direct_not_blocked(self, session, room_id: int, sender_id: int) -> None:
+        """
+        Проверяет, что direct-диалог не находится в состоянии BLOCKED.
+
+        Блокировка — серверная истина: если связь заблокирована, чат недоступен для отправки/чтения.
+        """
+        members_res = await session.execute(
+            select(RoomMember.user_id).where(
+                RoomMember.room_id == room_id,
+                RoomMember.user_id != sender_id,
+                RoomMember.status != MembershipStatus.BANNED,
+            )
+        )
+        peer_ids = [int(uid) for uid in members_res.scalars().all()]
+        if not peer_ids:
+            return
+        peer_id = peer_ids[0]
+        blocked_res = await session.execute(
+            select(Friendship.id).where(
+                Friendship.status == FriendshipStatus.BLOCKED,
+                (
+                    ((Friendship.sender_id == sender_id) & (Friendship.receiver_id == peer_id))
+                    | ((Friendship.sender_id == peer_id) & (Friendship.receiver_id == sender_id))
+                ),
+            ).limit(1)
+        )
+        if blocked_res.scalars().first():
+            raise ValueError("Чат недоступен: один из пользователей заблокировал другого")
+
     # ==========================================================================
     # ПОЛУЧЕНИЕ СООБЩЕНИЙ (CURSOR-ПАГИНАЦИЯ)
     # ==========================================================================
@@ -209,9 +257,18 @@ class MessageService:
             if not member:
                 raise ValueError("Вы не являетесь участником этой комнаты")
 
+            room_res = await session.execute(select(Room).where(Room.id == room_id))
+            room = room_res.scalars().first()
+            if room and room.type == "direct":
+                await self._ensure_direct_not_blocked(session, room_id, user_id)
+
             # 2. Формируем запрос: сообщения + никнейм отправителя
             query = (
-                select(Message, User.nickname.label("sender_nickname"))
+                select(
+                    Message,
+                    User.nickname.label("sender_nickname"),
+                    User.is_admin.label("sender_is_admin"),
+                )
                 .join(User, Message.sender_id == User.id)
                 .where(Message.room_id == room_id)
             )
@@ -228,22 +285,32 @@ class MessageService:
 
             # 5. Разворачиваем массив — в UI сообщения идут от старых к новым
             messages: List[Dict[str, Any]] = []
-            for msg, nickname in reversed(rows):
-                if msg.sender_id == user_id:
-                    is_read_res = await session.execute(
-                        select(MessageRead.id).where(
-                            MessageRead.message_id == msg.id,
-                            MessageRead.user_id != msg.sender_id,
-                        ).limit(1)
+            # Убираем N+1: читаем message_reads одной пачкой для всей страницы.
+            ordered_rows = list(reversed(rows))
+            message_ids = [msg.id for msg, _, _ in ordered_rows]
+            sender_by_message_id = {msg.id: int(msg.sender_id) for msg, _, _ in ordered_rows}
+            sender_seen_by_other: set[int] = set()
+            viewer_seen: set[int] = set()
+            if message_ids:
+                reads_res = await session.execute(
+                    select(MessageRead.message_id, MessageRead.user_id).where(
+                        MessageRead.message_id.in_(message_ids)
                     )
+                )
+                for message_id, reader_id in reads_res.all():
+                    sender_id = sender_by_message_id.get(int(message_id))
+                    if sender_id is None:
+                        continue
+                    if int(reader_id) != sender_id:
+                        sender_seen_by_other.add(int(message_id))
+                    if int(reader_id) == int(user_id):
+                        viewer_seen.add(int(message_id))
+
+            for msg, nickname, sender_is_admin in ordered_rows:
+                if int(msg.sender_id) == int(user_id):
+                    is_read = int(msg.id) in sender_seen_by_other
                 else:
-                    is_read_res = await session.execute(
-                        select(MessageRead.id).where(
-                            MessageRead.message_id == msg.id,
-                            MessageRead.user_id == user_id,
-                        ).limit(1)
-                    )
-                is_read = is_read_res.scalars().first() is not None
+                    is_read = int(msg.id) in viewer_seen
 
                 messages.append({
                     "id": msg.id,
@@ -251,9 +318,15 @@ class MessageService:
                     "sender_id": msg.sender_id,
                     "sender_device_id": msg.sender_device_id,
                     "sender_nickname": nickname,
+                    "sender_is_admin": bool(sender_is_admin),
                     "content": msg.content,  # ciphertext
                     "nonce": msg.nonce,
                     "key_version": msg.key_version,
+                    "reply_to_message_id": msg.reply_to_message_id,
+                    "is_pinned": bool(getattr(msg, "is_pinned", False)),
+                    "pinned_by_user_id": getattr(msg, "pinned_by_user_id", None),
+                    "pinned_at": msg.pinned_at.isoformat() if getattr(msg, "pinned_at", None) else None,
+                    "pin_note": getattr(msg, "pin_note", None),
                     "is_edited": msg.is_edited,
                     "is_read": is_read,
                     "edited_at": msg.edited_at.isoformat() if msg.edited_at else None,
@@ -352,6 +425,68 @@ class MessageService:
             session.add(message)
 
             # 5. Коммит
+            await session.commit()
+            await session.refresh(message)
+            return message
+
+    async def pin_message(
+        self,
+        room_id: int,
+        message_id: int,
+        actor_id: int,
+        pin_note: Optional[str] = None,
+    ) -> Message:
+        async for session in db_engine.get_async_session():
+            rights_res = await session.execute(
+                select(RoomMember).where(
+                    RoomMember.room_id == room_id,
+                    RoomMember.user_id == actor_id,
+                )
+            )
+            member = rights_res.scalars().first()
+            if not member or member.status not in (MembershipStatus.OWNER, MembershipStatus.ADMIN):
+                raise ValueError("Недостаточно прав для закрепления")
+
+            msg_res = await session.execute(
+                select(Message).where(Message.id == message_id, Message.room_id == room_id)
+            )
+            message = msg_res.scalars().first()
+            if not message:
+                raise ValueError("Сообщение не найдено")
+
+            message.is_pinned = True
+            message.pinned_by_user_id = actor_id
+            message.pinned_at = datetime.utcnow()
+            message.pin_note = pin_note
+            session.add(message)
+            await session.commit()
+            await session.refresh(message)
+            return message
+
+    async def unpin_message(self, room_id: int, message_id: int, actor_id: int) -> Message:
+        async for session in db_engine.get_async_session():
+            rights_res = await session.execute(
+                select(RoomMember).where(
+                    RoomMember.room_id == room_id,
+                    RoomMember.user_id == actor_id,
+                )
+            )
+            member = rights_res.scalars().first()
+            if not member or member.status not in (MembershipStatus.OWNER, MembershipStatus.ADMIN):
+                raise ValueError("Недостаточно прав для открепления")
+
+            msg_res = await session.execute(
+                select(Message).where(Message.id == message_id, Message.room_id == room_id)
+            )
+            message = msg_res.scalars().first()
+            if not message:
+                raise ValueError("Сообщение не найдено")
+
+            message.is_pinned = False
+            message.pinned_by_user_id = None
+            message.pinned_at = None
+            message.pin_note = None
+            session.add(message)
             await session.commit()
             await session.refresh(message)
             return message

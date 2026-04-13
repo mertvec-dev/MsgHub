@@ -38,6 +38,17 @@ class PeerDeviceKeysResponse(BaseModel):
     user_id: int
     devices: list[PeerDeviceKeyItem]
 
+
+class DirectE2EReadinessResponse(BaseModel):
+    """Серверное подтверждение готовности E2E для direct-чата."""
+    peer_user_id: int
+    direct_room_id: int | None
+    friendship_confirmed: bool
+    viewer_has_device_key: bool
+    peer_has_device_key: bool
+    ready: bool
+    reason: str | None = None
+
 class RoomKeyEnvelopeItem(BaseModel):
     """Схема для конверта с публичным ключом E2E для шифрования сообщений в комнате"""
     user_id: int

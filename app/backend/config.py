@@ -111,6 +111,9 @@ class Settings(BaseSettings):
     RATE_LIMIT_LOGIN: str = "5/minute"       # Auth-эндпоинты (брутфорс)
     RATE_LIMIT_DEFAULT: str = "100/minute"   # Остальные запросы
     RATE_LIMIT_MESSAGE: str = "30/minute"    # Отправка сообщений (спам)
+    RATE_LIMIT_FRIEND_REQUEST: str = "15/minute"
+    RATE_LIMIT_FRIEND_BLOCK: str = "20/minute"
+    RATE_LIMIT_ROOM_INVITE: str = "20/minute"
 
     # ─── Логирование ───
     LOG_LEVEL: str = "INFO"  # DEBUG / INFO / WARNING / ERROR

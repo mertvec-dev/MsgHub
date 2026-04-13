@@ -29,3 +29,7 @@ slowapi
 
 # Криптография
 cryptography
+
+# Тестирование
+pytest
+httpx

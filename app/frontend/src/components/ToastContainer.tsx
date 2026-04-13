@@ -1,4 +1,5 @@
-import { useToast, type ToastType } from '../context/ToastContext';
+import { type ToastType } from '../context/ToastContext';
+import { useToast } from '../context/useToast';
 import '../styles/Toast.css';
 
 function getIcon(type: ToastType) {
@@ -15,7 +16,13 @@ function getIcon(type: ToastType) {
   }
 }
 
-function ToastItem({ id, message, type }: any) {
+interface ToastItemProps {
+  id: string;
+  message: string;
+  type: ToastType;
+}
+
+function ToastItem({ id, message, type }: ToastItemProps) {
   const { removeToast } = useToast();
 
   return (

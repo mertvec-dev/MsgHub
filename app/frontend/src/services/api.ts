@@ -67,6 +67,7 @@ export interface User {
   id: number;
   nickname: string;
   username: string;
+  role?: 'user' | 'moderator' | 'super_admin';
   email?: string;
   avatar_url?: string | null;
   status_message?: string | null;
@@ -115,7 +116,13 @@ export interface Message {
   room_id: number;
   sender_id: number;
   sender_nickname?: string;
+  sender_is_admin?: boolean;
   sender_device_id?: string | null;
+  reply_to_message_id?: number | null;
+  is_pinned?: boolean;
+  pinned_by_user_id?: number | null;
+  pinned_at?: string | null;
+  pin_note?: string | null;
   content: string;
   nonce: string;
   key_version: number;
@@ -131,6 +138,7 @@ export interface MessageSendPayload {
   nonce: string;
   key_version: number;
   sender_device_id?: string;
+  reply_to_message_id?: number;
 }
 
 export interface MessageEditPayload {
@@ -153,6 +161,36 @@ export interface SessionListResponse {
   sessions: SessionInfo[];
 }
 
+export interface AdminOverview {
+  users_total: number;
+  admins_total: number;
+  banned_total: number;
+  rooms_total: number;
+  messages_total: number;
+}
+
+export interface AdminAuditLogItem {
+  id: number;
+  actor_user_id: number;
+  target_user_id?: number | null;
+  action: string;
+  details?: string | null;
+  ip_address?: string | null;
+  user_agent?: string | null;
+  created_at: string;
+}
+
+export interface SecurityEventItem {
+  id: number;
+  user_id?: number | null;
+  event_type: string;
+  severity: string;
+  details?: string | null;
+  ip_address?: string | null;
+  user_agent?: string | null;
+  created_at: string;
+}
+
 export interface DeviceKeyItem {
   user_id: number;
   device_id: string;
@@ -165,13 +203,31 @@ export interface PeerDeviceKeysResponse {
   devices: DeviceKeyItem[];
 }
 
+export interface DirectE2EReadinessResponse {
+  peer_user_id: number;
+  direct_room_id: number | null;
+  friendship_confirmed: boolean;
+  viewer_has_device_key: boolean;
+  peer_has_device_key: boolean;
+  ready: boolean;
+  reason?: string | null;
+}
+
 export interface Friendship {
   id: number;
   sender_id: number;
   receiver_id: number;
   status: 'pending' | 'accepted' | 'blocked';
+  blocked_by_me?: boolean;
   created_at: string;
   updated_at: string;
+}
+
+export interface RoomMemberInfo {
+  id: number;
+  nickname: string;
+  username: string;
+  is_admin?: boolean;
 }
 
 export interface E2EPublicKeyResponse {
@@ -273,6 +329,22 @@ export const auth = {
   adminBan: (userId: number) => api.post<User>(`/auth/admin/users/${userId}/ban`, {}),
   adminUnban: (userId: number) => api.post<User>(`/auth/admin/users/${userId}/unban`, {}),
   adminDeactivate: (userId: number) => api.post<User>(`/auth/admin/users/${userId}/deactivate`, {}),
+  adminOverview: () => api.get<AdminOverview>('/auth/admin/overview'),
+  adminSetRole: (userId: number, role: 'user' | 'moderator' | 'super_admin') =>
+    api.post<User>(`/auth/admin/users/${userId}/role`, { role }),
+  adminGrantPermission: (userId: number, permission: string) =>
+    api.post(`/auth/admin/users/${userId}/permissions/grant`, { permission }),
+  adminRevokePermission: (userId: number, permission: string) =>
+    api.post(`/auth/admin/users/${userId}/permissions/revoke`, { permission }),
+  adminSetUserTag: (userId: number, profile_tag: string) =>
+    api.post<User>(`/auth/admin/users/${userId}/tag`, { profile_tag }),
+  adminClearUserTag: (userId: number) =>
+    api.post<User>(`/auth/admin/users/${userId}/tag`, { profile_tag: null }),
+  adminDeleteUser: (userId: number) =>
+    api.delete(`/auth/admin/users/${userId}`),
+  adminMyPermissions: () => api.get<{ permissions: string[] }>('/auth/admin/me/permissions'),
+  adminAuditLogs: (limit = 100) => api.get<AdminAuditLogItem[]>('/auth/admin/audit-logs', { params: { limit } }),
+  adminSecurityEvents: (limit = 100) => api.get<SecurityEventItem[]>('/auth/admin/security-events', { params: { limit } }),
 };
 
 export const e2e = {
@@ -291,6 +363,10 @@ export const e2e = {
     }),
   getPeerDeviceKeys: (userId: number) =>
     api.get<PeerDeviceKeysResponse>(`/auth/e2e/device-keys/${userId}`),
+  getDirectReadiness: (peerUserId: number) =>
+    api.get<DirectE2EReadinessResponse>(`/auth/e2e/direct-readiness/${peerUserId}`),
+  forceSyncWithPeer: (peerUserId: number) =>
+    api.get(`/auth/e2e/direct-readiness/${peerUserId}`),
   getDeviceId: () => ensureDeviceId(),
 };
 
@@ -304,7 +380,7 @@ export function getAccessToken(): string | null {
 
 export const rooms = {
   getMyRooms: () => api.get<Room[]>('/rooms/my'),
-  getMembers: (roomId: number) => api.get(`/rooms/${roomId}/members`),
+  getMembers: (roomId: number) => api.get<RoomMemberInfo[]>(`/rooms/${roomId}/members`),
   createGroup: (name: string, user_ids: number[] = []) =>
     api.post<Room>('/rooms/create', { name, type: 'group', user_ids }),
   createDirect: (id: number) => api.post<Room>(`/rooms/direct/${id}`, {}),
@@ -317,6 +393,10 @@ export const rooms = {
   deleteSelf: (roomId: number) => api.delete(`/rooms/self/${roomId}`),
   ban: (roomId: number, userId: number) =>
     api.post('/rooms/ban', null, { params: { room_id: roomId, user_id: userId } }),
+  mute: (roomId: number, userId: number, minutes: number, reason?: string) =>
+    api.post('/rooms/mute', { user_id: userId, minutes, reason }, { params: { room_id: roomId } }),
+  unmute: (roomId: number, userId: number) =>
+    api.post('/rooms/unmute', null, { params: { room_id: roomId, user_id: userId } }),
   upsertRoomKeys: (roomId: number, payload: RoomKeyEnvelopeUpsertPayload) =>
     api.post(`/rooms/${roomId}/keys/upsert`, payload),
   getMyRoomKey: (roomId: number) =>
@@ -336,6 +416,10 @@ export const messages = {
     api.delete(`/messages/${Number(id)}`),
   getUnreadCount: () => api.get('/messages/unread/count'),
   markAsRead: (roomId: number) => api.get(`/messages/read/${roomId}`),
+  pin: (roomId: number, messageId: number, pin_note?: string) =>
+    api.post(`/messages/pin/${roomId}/${messageId}`, { pin_note }),
+  unpin: (roomId: number, messageId: number) =>
+    api.post(`/messages/unpin/${roomId}/${messageId}`, {}),
 };
 
 export const friends = {
@@ -344,5 +428,6 @@ export const friends = {
   decline: (id: number) => api.post(`/friends/decline/${id}`),
   remove: (id: number) => api.delete(`/friends/${id}`),
   block: (targetUserId: number) => api.post(`/friends/block/${targetUserId}`),
+  unblock: (targetUserId: number) => api.post(`/friends/unblock/${targetUserId}`),
   getFriends: () => api.get('/friends/'),
 };

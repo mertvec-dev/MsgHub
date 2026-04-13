@@ -8,6 +8,9 @@ from database.models.message_reads import MessageRead
 from database.models.users_public_key import UserPublicKey
 from database.models.room_key_envelopes import RoomKeyEnvelope
 from database.models.devices import Device
+from database.models.user_permissions import UserPermission
+from database.models.admin_audit_logs import AdminAuditLog
+from database.models.security_events import SecurityEvent
 
 __all__ = [
     "User",
@@ -20,4 +23,7 @@ __all__ = [
     "UserPublicKey",
     "RoomKeyEnvelope",
     "Device",
+    "UserPermission",
+    "AdminAuditLog",
+    "SecurityEvent",
 ]

@@ -5,6 +5,8 @@
     "dev": "npm run dev --prefix app/frontend",
     "build": "npm run build --prefix app/frontend",
     "lint": "npm run lint --prefix app/frontend",
-    "preview": "npm run preview --prefix app/frontend"
+    "preview": "npm run preview --prefix app/frontend",
+    "test:backend": "python -m pytest -q",
+    "check": "npm run lint && npm run build && npm run test:backend"
   }
 }

@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { useAuth } from '../context/AuthContext';
+import { useAuth } from '../context/useAuth';
+import { apiErrorDetail } from '../chat/utils/apiError';
 import '../styles/Login.css';
 
 export default function LoginPage() {
@@ -20,16 +21,8 @@ export default function LoginPage() {
       } else {
         await login(username, password);
       }
-    } catch (err: any) {
-      const detail = err.response?.data?.detail;
-      if (Array.isArray(detail)) {
-        // Pydantic validation errors — берём первое сообщение
-        setError(detail[0]?.msg || 'Ошибка валидации');
-      } else if (typeof detail === 'string') {
-        setError(detail);
-      } else {
-        setError(err.message || 'Ошибка');
-      }
+    } catch (err: unknown) {
+      setError(apiErrorDetail(err, 'Ошибка'));
     }
   };
 

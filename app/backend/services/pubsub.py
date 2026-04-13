@@ -129,6 +129,12 @@ async def handle_message_from_redis(data: dict):
         if peer_id is not None:
             await manager.send_personal_message(data, int(peer_id))
 
+    elif action == "personal_event":
+        target_user_id = data.get("target_user_id")
+        event = data.get("event")
+        if target_user_id is not None and isinstance(event, dict):
+            await manager.send_personal_message(event, int(target_user_id))
+
     # ─── Системное уведомление ───
     elif action == "system":
         await manager.broadcast(data)

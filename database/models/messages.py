@@ -25,6 +25,11 @@ class Message(SQLModel, table=True):
     room_id: int = Field(foreign_key="rooms.id", index=True)
     sender_id: int = Field(foreign_key="users.id", index=True)
     sender_device_id: Optional[str] = Field(default=None, index=True)
+    reply_to_message_id: Optional[int] = Field(default=None, foreign_key="messages.id", index=True)
+    is_pinned: bool = Field(default=False, index=True)
+    pinned_by_user_id: Optional[int] = Field(default=None, foreign_key="users.id")
+    pinned_at: Optional[datetime] = Field(default=None, index=True)
+    pin_note: Optional[str] = Field(default=None, max_length=255)
 
     content: str = Field(...) # зашифрованный текст сообщения
     key_version: int = Field(default=1, index=True) # версия ключа для шифрования

@@ -1,3 +1,5 @@
+name: msghub
+
 services:
   db: # БАЗА ДАННЫХ
     image: postgres:15 # Какой образ БД использовать
@@ -55,7 +57,7 @@ services:
     restart: unless-stopped # Перезапуск контейнера при сбое
   
   nginx: # Nginx
-    image: nginx:latest
+    image: nginx:1.27-alpine
     container_name: msghub_nginx
     ports:
       - "80:80"

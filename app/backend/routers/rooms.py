@@ -5,40 +5,35 @@
 # ============================================================================
 # ИМПОРТЫ
 # ============================================================================
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, HTTPException, status, Depends, Request
 
 import logging
 
-# SQLModel-запросы к БД
-from sqlmodel import select
-
 # Pydantic-схемы для валидации
 from app.backend.schemas.rooms import RoomCreate, RoomResponse
+from app.backend.schemas.rooms import RoomMuteRequest
 
 # Сервис комнат — бизнес-логика
 from app.backend.services.rooms_service import room_service
+from app.backend.services.auth_service import auth_service
 
 # Получение user_id из JWT-токена
 from app.backend.utils.jwt_utils import get_current_user
 
 # WebSocket менеджер — для уведомлений
-from app.backend.websocket import manager
-
-# Pub/Sub — для уведомлений между инстансами
-from app.backend.services import pubsub
+from app.backend.services.realtime_bus import realtime_bus
+from app.backend.services.e2e_orchestrator import e2e_orchestrator
+from app.backend.services.audit_log_service import audit_log_service
+from app.backend.utils.rate_limiter import limiter
+from app.backend.config import settings
 
 # ORM-модели
 from database.models.rooms import RoomType
-from database.models.room_member import RoomMember
-from database.models.users import User
 from app.backend.schemas.e2e import (
     RoomKeyEnvelopeUpsertRequest,
     RoomKeyEnvelopeResponse,
     RoomKeyRotateResponse,
 )
-
-# Асинхронная сессия БД
-from database.engine import db_engine
 
 logger = logging.getLogger(__name__)
 
@@ -84,16 +79,7 @@ async def create_room(data: RoomCreate, user_id: int = Depends(get_current_user)
                 "room_name": room.name,
                 "room_type": room.type.value if hasattr(room.type, 'value') else str(room.type),
             }
-
-            # Если пользователь онлайн на ЭТОМ инстансе — отправляем напрямую
-            if manager.is_online(invited_id):
-                logger.info(f"Отправляем new_room пользователю {invited_id}")
-                await manager.send_personal_message(notification, invited_id)
-            else:
-                logger.warning(f"Пользователь {invited_id} не онлайн на этом сервере")
-
-            # Публикуем в Redis — если пользователь на ДРУГОМ инстансе, тот услышит
-            await pubsub.publish_message(notification)
+            await realtime_bus.emit_personal_event(user_id=invited_id, payload=notification)
 
         return room
     except ValueError as e:
@@ -125,8 +111,29 @@ async def create_direct(target_user_id: int, user_id: int = Depends(get_current_
             "room_name": None,
             "room_type": "direct",
         }
-        await manager.send_personal_message(notification, target_user_id)
-        await pubsub.publish_message(notification)
+        await realtime_bus.emit_personal_event(user_id=target_user_id, payload=notification)
+        readiness = await auth_service.get_direct_e2e_readiness(user_id, target_user_id)
+        await realtime_bus.emit_personal_event(
+            user_id=user_id,
+            payload={
+                "action": "direct_room_ready",
+                "room_id": room.id,
+                "peer_id": target_user_id,
+                "e2e_ready": readiness.get("ready", False),
+                "e2e_reason": readiness.get("reason"),
+            },
+        )
+        await realtime_bus.emit_personal_event(
+            user_id=target_user_id,
+            payload={
+                "action": "direct_room_ready",
+                "room_id": room.id,
+                "peer_id": user_id,
+                "e2e_ready": readiness.get("ready", False),
+                "e2e_reason": readiness.get("reason"),
+            },
+        )
+        await e2e_orchestrator.sync_direct_pair(user_id, target_user_id, reason="direct_room_created")
 
         return room
     except ValueError as e:
@@ -162,22 +169,7 @@ async def get_room_members(room_id: int, user_id: int = Depends(get_current_user
     Возвращает id, nickname, username всех участников комнаты.
     Нужно фронтенду, чтобы показать имя собеседника в direct-чате.
     """
-    async for session in db_engine.get_async_session():
-        result = await session.execute(
-            select(User)
-            .join(RoomMember, User.id == RoomMember.user_id)
-            .where(RoomMember.room_id == room_id)
-        )
-        members = result.scalars().all()
-
-        return [
-            {
-                "id": m.id,
-                "nickname": m.nickname,
-                "username": m.username,
-            }
-            for m in members
-        ]
+    return await room_service.get_room_members(room_id)
 
 
 # ============================================================================
@@ -189,7 +181,9 @@ async def get_room_members(room_id: int, user_id: int = Depends(get_current_user
     summary="Пригласить пользователя в комнату",
     description="Добавляет пользователя в комнату (если не забанен)"
 )
+@limiter.limit(settings.RATE_LIMIT_ROOM_INVITE)
 async def invite_user(
+    request: Request,
     room_id: int,
     user_id: int,
     actor_id: int = Depends(get_current_user)
@@ -259,7 +253,9 @@ async def leave_room(room_id: int, user_id: int = Depends(get_current_user)):
     summary="Заблокировать пользователя в комнате",
     description="Меняет статус участника на 'banned'"
 )
+@limiter.limit(settings.RATE_LIMIT_ROOM_INVITE)
 async def ban_user(
+    request: Request,
     room_id: int,
     user_id: int,
     actor_id: int = Depends(get_current_user)
@@ -304,18 +300,88 @@ async def clear_history(room_id: int, user_id: int = Depends(get_current_user)):
         )
 
 
+@router.post(
+    "/mute",
+    summary="Тихий mute участника",
+    description="Временно запрещает отправку сообщений в группе (timeout)",
+)
+@limiter.limit(settings.RATE_LIMIT_ROOM_INVITE)
+async def mute_user(
+    request: Request,
+    payload: RoomMuteRequest,
+    room_id: int,
+    actor_id: int = Depends(get_current_user),
+):
+    try:
+        await room_service.mute_user(
+            room_id=room_id,
+            user_id=payload.user_id,
+            actor_id=actor_id,
+            minutes=payload.minutes,
+            reason=payload.reason,
+        )
+        await realtime_bus.emit_room_event(
+            room_id=room_id,
+            payload={
+                "action": "member_muted",
+                "room_id": room_id,
+                "user_id": payload.user_id,
+                "minutes": payload.minutes,
+                "reason": payload.reason,
+            },
+        )
+        return {"message": "Пользователь получил mute"}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
+@router.post(
+    "/unmute",
+    summary="Снять mute участника",
+)
+@limiter.limit(settings.RATE_LIMIT_ROOM_INVITE)
+async def unmute_user(
+    request: Request,
+    room_id: int,
+    user_id: int,
+    actor_id: int = Depends(get_current_user),
+):
+    try:
+        await room_service.unmute_user(room_id=room_id, user_id=user_id, actor_id=actor_id)
+        await realtime_bus.emit_room_event(
+            room_id=room_id,
+            payload={
+                "action": "member_unmuted",
+                "room_id": room_id,
+                "user_id": user_id,
+            },
+        )
+        return {"message": "mute снят"}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
 @router.delete(
     "/self/{room_id}",
     summary="Удалить комнату для себя",
     description="Скрывает комнату из списка текущего пользователя"
 )
-async def delete_room_self(room_id: int, user_id: int = Depends(get_current_user)):
+async def delete_room_self(request: Request, room_id: int, user_id: int = Depends(get_current_user)):
     """
     Удаляет запись участника из room_members для текущего пользователя.
     Комната перестаёт появляться в списке «Мои комнаты».
     """
     try:
         await room_service.delete_room_for_self(room_id, user_id)
+        actor = await auth_service.get_me(user_id)
+        if bool(actor.is_admin):
+            await audit_log_service.log_admin_action(
+                actor_user_id=user_id,
+                action="delete_chat_for_self",
+                details=f"room_id={room_id}",
+                ip_address=request.client.host if request.client else None,
+                user_agent=request.headers.get("User-Agent"),
+            )
         return {"message": "Чат удален"}
     except ValueError as e:
         raise HTTPException(

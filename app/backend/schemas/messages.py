@@ -10,6 +10,7 @@ class MessageCreate(BaseModel):
     nonce: str = Field(..., min_length=12, max_length=12)
     key_version: int = Field(default=1, ge=1)
     sender_device_id: Optional[str] = Field(default=None, max_length=255)
+    reply_to_message_id: Optional[int] = Field(default=None, gt=0)
 
     @field_validator("content")
     @classmethod
@@ -43,6 +44,11 @@ class MessageResponse(BaseModel):
     content: str
     nonce: str
     key_version: int
+    reply_to_message_id: Optional[int] = None
+    is_pinned: bool = False
+    pinned_by_user_id: Optional[int] = None
+    pinned_at: Optional[datetime] = None
+    pin_note: Optional[str] = None
     is_edited: bool
     edited_at: Optional[datetime] = None
     created_at: datetime
@@ -55,3 +61,7 @@ class MessagesList(BaseModel):
     messages: list[MessageResponse]
     total: int
     has_more: bool
+
+
+class MessagePinRequest(BaseModel):
+    pin_note: Optional[str] = Field(default=None, max_length=255)

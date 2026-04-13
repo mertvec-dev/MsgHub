@@ -1,3 +1,5 @@
+name: msghub-dev
+
 services:
   db: # БАЗА ДАННЫХ
     image: postgres:15 # Какой образ БД использовать
