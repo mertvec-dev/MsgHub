@@ -1,0 +1,13 @@
+# Скопируй на сервер: cp docker-compose.override.example.yml docker-compose.override.yml
+# Файл docker-compose.override.yml в .gitignore — git pull не конфликтует с правками ВМ.
+# Compose автоматически мержит его с docker-compose.yml.
+
+services:
+  nginx:
+    ports:
+      - "443:443"
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # Опционально: статика с диска вместо встроенной в образ Dockerfile.nginx
+      # (тогда на ВМ нужен npm run build в app/frontend и эта папка)
+      # - ./app/frontend/dist:/usr/share/nginx/html:ro

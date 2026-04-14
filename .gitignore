@@ -26,6 +26,9 @@ env/
 .DS_Store
 Thumbs.db
 
+# Docker Compose: только на сервере (HTTPS, certbot и т.д.)
+docker-compose.override.yml
+
 # Environment variables 
 .env
 .env.local
