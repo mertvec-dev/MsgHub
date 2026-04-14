@@ -1,6 +1,9 @@
 # Скопируй на сервер: cp docker-compose.override.example.yml docker-compose.override.yml
 # Файл docker-compose.override.yml в .gitignore — git pull не конфликтует с правками ВМ.
 # Compose автоматически мержит его с docker-compose.yml.
+#
+# Не правьте на сервере docker-compose.yml и nginx.conf/nginx.conf вручную — после git pull
+# будет конфликт. Для pull: bash scripts/vm-git-pull.sh
 
 services:
   nginx:

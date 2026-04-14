@@ -27,10 +27,11 @@ async def app_lifespan(_: FastAPI) -> AsyncIterator[None]:
     - закрывает пул БД.
     """
     logger.info("Запуск MsgHub Backend...")
-    # Alembic вызывает asyncio.run() внутри env.py — запускаем в отдельном потоке,
-    # чтобы не конфликтовать с текущим event loop FastAPI.
-    await asyncio.to_thread(run_alembic_upgrade_head)
+    # Сначала create_all: на пустой БД создаются таблицы из моделей. Миграции Alembic
+    # делают ALTER … IF NOT EXISTS — они предполагают, что таблицы уже есть.
     await db_engine.init_db()
+    # Alembic вызывает asyncio.run() внутри env.py — в отдельном потоке.
+    await asyncio.to_thread(run_alembic_upgrade_head)
     logger.info("База данных готова")
 
     try:
