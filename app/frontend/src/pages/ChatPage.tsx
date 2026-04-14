@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { isAxiosError } from 'axios';
 import Prism from 'prismjs';
 import 'prismjs/components/prism-rust';
 import 'prismjs/components/prism-go';
@@ -32,12 +33,11 @@ import {
   e2e,
   getRoomSidebarTitle,
   getAccessToken,
-  type AdminOverview,
-  type AdminAuditLogItem,
-  type SecurityEventItem,
   type Room,
   type Message,
 } from '../services/api';
+import { ProfileTagBadge } from '../components/ProfileTagBadge';
+import { PromptDialog } from '../components/PromptDialog';
 import {
   ensureOwnPublicKey,
   encryptForPeer,
@@ -128,7 +128,6 @@ interface FriendRequest {
   username?: string;
   is_admin?: boolean;
   partner_id?: number;
-  is_admin?: boolean;
   status: 'pending' | 'accepted' | 'blocked';
 }
 
@@ -145,6 +144,7 @@ interface RoomMember {
   nickname: string;
   username: string;
   is_admin?: boolean;
+  profile_tag?: string | null;
   muted_until?: string | null;
   muted_reason?: string | null;
 }
@@ -156,7 +156,7 @@ interface PendingReply {
 }
 
 export default function ChatPage() {
-  const { userId, logout, profileNickname, profileUsername, isAdmin } = useAuth();
+  const { userId, logout, profileNickname, profileUsername, isStaff, userRole: authUserRole } = useAuth();
   /** Сообщения с API/WebSocket могут отдавать id как number или string — строгое === ломало класс .own. */
   const isMe = useCallback(
     (id: number | string | undefined | null) =>
@@ -181,13 +181,14 @@ export default function ChatPage() {
   const myRoomsRef = useRef<Room[]>([]);
 
   // Меню
-  const [activeMenu, setActiveMenu] = useState<'chats' | 'friends' | 'requests' | 'settings' | 'admin'>('chats');
+  const [activeMenu, setActiveMenu] = useState<'chats' | 'friends' | 'requests' | 'settings'>('chats');
   const [friendList, setFriendList] = useState<Friend[]>([]);
   const [friendRequests, setFriendRequests] = useState<FriendRequest[]>([]);
   const [blockedUsers, setBlockedUsers] = useState<Friend[]>([]);
   const [newRequestIds, setNewRequestIds] = useState<Set<number>>(new Set());
   const prevRequestIdsRef = useRef<Set<number>>(new Set());
   const [friendUsername, setFriendUsername] = useState('');
+  const [friendRequestSubmitting, setFriendRequestSubmitting] = useState(false);
   const [searchInput, setSearchInput] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [sendCooldown, setSendCooldown] = useState(false);
@@ -206,6 +207,8 @@ export default function ChatPage() {
   const [showRoomMenu, setShowRoomMenu] = useState(false);
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [inviteUserId, setInviteUserId] = useState('');
+  const [showAliasPrompt, setShowAliasPrompt] = useState(false);
+  const [aliasPromptPartnerId, setAliasPromptPartnerId] = useState<number | null>(null);
   const [showProfileMenu, setShowProfileMenu] = useState(false);
 
   const messagesEnd = useRef<HTMLDivElement>(null);
@@ -221,6 +224,11 @@ export default function ChatPage() {
   const ws = useRef<WebSocket | null>(null);
   const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef<number | null>(null);
+  const scheduleReconnectRef = useRef<() => void>(() => {});
+  const bumpChatNavRef = useRef<() => void>(() => {});
+  const [chatNavAnim, setChatNavAnim] = useState(false);
+  const [requestsNavAnim, setRequestsNavAnim] = useState(false);
+  const prevFriendReqLenRef = useRef<number | null>(null);
   const recentEventIdsRef = useRef<Set<string>>(new Set());
   /** Актуальная комната для обработчиков WebSocket (иначе замыкание на старый selectedRoom). */
   const selectedRoomIdRef = useRef<number | null>(null);
@@ -245,12 +253,6 @@ export default function ChatPage() {
     status_message: '',
     profile_tag: '',
   });
-  const [adminUsers, setAdminUsers] = useState<Array<{ id: number; username: string; nickname: string; is_admin?: boolean; is_banned?: boolean; role?: string; profile_tag?: string | null }>>([]);
-  const [adminTagDraftByUser, setAdminTagDraftByUser] = useState<Record<number, string>>({});
-  const [adminOverview, setAdminOverview] = useState<AdminOverview | null>(null);
-  const [adminLogs, setAdminLogs] = useState<AdminAuditLogItem[]>([]);
-  const [securityEvents, setSecurityEvents] = useState<SecurityEventItem[]>([]);
-  const [myPermissions, setMyPermissions] = useState<string[]>([]);
   const [myRole, setMyRole] = useState<'user' | 'moderator' | 'super_admin'>('user');
   const [isMobileView, setIsMobileView] = useState<boolean>(typeof window !== 'undefined' ? window.innerWidth <= 900 : false);
   const adminBadge = (visible?: boolean, role?: string) => {
@@ -317,6 +319,26 @@ export default function ChatPage() {
   useEffect(() => {
     activePeerPublicKeyRef.current = activePeerPublicKey;
   }, [activePeerPublicKey]);
+
+  useEffect(() => {
+    bumpChatNavRef.current = () => {
+      setChatNavAnim(true);
+      window.setTimeout(() => setChatNavAnim(false), 650);
+    };
+  }, []);
+
+  useEffect(() => {
+    const n = friendRequests.length;
+    if (prevFriendReqLenRef.current === null) {
+      prevFriendReqLenRef.current = n;
+      return;
+    }
+    if (n > prevFriendReqLenRef.current) {
+      setRequestsNavAnim(true);
+      window.setTimeout(() => setRequestsNavAnim(false), 650);
+    }
+    prevFriendReqLenRef.current = n;
+  }, [friendRequests.length]);
 
   // Загрузка данных
   const fetchPeerPublicKey = useCallback(async (partnerId: number): Promise<string | null> => {
@@ -524,10 +546,12 @@ export default function ChatPage() {
       void (async () => {
         setGifLoading(true);
         try {
-          const items = await searchTenorGifs(q, 18);
+          const { items, error } = await searchTenorGifs(q, 18);
           setGifResults(items);
-        } catch {
+          if (error) showToast(error, 'error');
+        } catch (e) {
           setGifResults([]);
+          showToast(e instanceof Error ? e.message : 'Ошибка поиска GIF', 'error');
         } finally {
           setGifLoading(false);
         }
@@ -535,6 +559,10 @@ export default function ChatPage() {
     }, 280);
     return () => window.clearTimeout(timer);
   }, [gifQuery, showGifPicker]);
+
+  useEffect(() => {
+    if (authUserRole) setMyRole(authUserRole);
+  }, [authUserRole]);
 
   const loadRoomMembers = async (roomId: number) => {
     try {
@@ -560,21 +588,6 @@ export default function ChatPage() {
       });
       setMyRole((res.data.role as 'user' | 'moderator' | 'super_admin') || 'user');
     }).catch(() => {});
-    if (isAdmin) {
-      void auth.adminListUsers().then((res) => {
-        const users = res.data || [];
-        setAdminUsers(users);
-        const initialDrafts: Record<number, string> = {};
-        for (const u of users) {
-          initialDrafts[Number(u.id)] = u.profile_tag ?? '';
-        }
-        setAdminTagDraftByUser(initialDrafts);
-      }).catch(() => {});
-      void auth.adminOverview().then((res) => setAdminOverview(res.data)).catch(() => {});
-      void auth.adminAuditLogs(20).then((res) => setAdminLogs(res.data || [])).catch(() => {});
-      void auth.adminSecurityEvents(20).then((res) => setSecurityEvents(res.data || [])).catch(() => {});
-      void auth.adminMyPermissions().then((res) => setMyPermissions(res.data.permissions || [])).catch(() => {});
-    }
   }, []);
 
   // Гарантируем, что у текущего клиента есть E2E public key на сервере.
@@ -778,6 +791,9 @@ export default function ChatPage() {
         console.log("📥 WebSocket:", data.action, data);
         switch (data.action) {
           case 'new_message':
+            if (!sameId(data.room_id, selectedRoomIdRef.current) && !isMe(data.sender_id)) {
+              bumpChatNavRef.current();
+            }
             if (sameId(data.room_id, roomOpen)) {
               const nickname = data.sender_nickname || (isMe(data.sender_id) ? 'Вы' : 'Пользователь');
               void (async () => {
@@ -842,6 +858,7 @@ export default function ChatPage() {
                     id: data.id,
                     sender_id: data.sender_id,
                     sender_nickname: nickname,
+                    sender_profile_tag: data.sender_profile_tag ?? null,
                     sender_is_admin: Boolean(data.sender_is_admin),
                     reply_to_message_id: data.reply_to_message_id ?? null,
                     is_pinned: Boolean(data.is_pinned),
@@ -922,12 +939,12 @@ export default function ChatPage() {
                 setSelectedRoom(null);
                 setMsgList([]);
               }
-              await loadUnreadCounts();
+              void loadUnreadCounts();
               showToast('Direct-чат заблокирован администратором/пользователем', 'info');
             }
             break;
           case 'friends_sync':
-            await loadFriendsData();
+            void loadFriendsData();
             break;
           case 'message_edited':
             if (sameId(data.room_id, roomOpen)) {
@@ -1096,7 +1113,7 @@ export default function ChatPage() {
 
     socket.onclose = () => {
       console.log('❌ WebSocket отключился');
-      scheduleReconnect();
+      scheduleReconnectRef.current();
     };
     return () => {
       if (reconnectTimerRef.current != null) {
@@ -1110,7 +1127,7 @@ export default function ChatPage() {
         ws.current = null;
       }
     };
-  }, [userId, isMe, fetchPeerPublicKey, warmupPeerDevices, resolvePeerPublicKey, scheduleReconnect]);
+  }, [userId, isMe, fetchPeerPublicKey, warmupPeerDevices, resolvePeerPublicKey]);
 
   // Смена комнаты: снова join_room (сокет уже авторизован с сервера)
   useEffect(() => {
@@ -1241,6 +1258,23 @@ export default function ChatPage() {
     }
   }, [selectedRoom, activePeerPublicKey, ensureGroupRoomKey, resolvePeerPublicKey]);
 
+  useEffect(() => {
+    scheduleReconnectRef.current = () => {
+      if (reconnectTimerRef.current != null) return;
+      const attempt = reconnectAttemptRef.current;
+      const backoffMs = Math.min(12_000, 1_000 * (2 ** attempt));
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        reconnectAttemptRef.current += 1;
+        void loadRooms();
+        if (selectedRoomRef.current) {
+          void loadMessages(false);
+        }
+        setPeerKeyRetryTick((v) => v + 1);
+      }, backoffMs);
+    };
+  }, [loadMessages, loadRooms]);
+
   // В direct-чате после перезахода ключ собеседника может приехать позже, чем первая загрузка истории.
   // Как только ключ появился — перезагружаем сообщения, чтобы они сразу расшифровались.
   useEffect(() => {
@@ -1323,21 +1357,6 @@ export default function ChatPage() {
     setPreviewCache(room.id, text);
   }, [setPreviewCache, showToast, userId]);
 
-  const scheduleReconnect = useCallback(() => {
-    if (reconnectTimerRef.current != null) return;
-    const attempt = reconnectAttemptRef.current;
-    const backoffMs = Math.min(12_000, 1_000 * (2 ** attempt));
-    reconnectTimerRef.current = window.setTimeout(() => {
-      reconnectTimerRef.current = null;
-      reconnectAttemptRef.current += 1;
-      loadRooms();
-      if (selectedRoomRef.current) {
-        void loadMessages(selectedRoomRef.current.id, false);
-      }
-      setPeerKeyRetryTick((v) => v + 1);
-    }, backoffMs);
-  }, []);
-
   const appendEmoji = (emoji: string) => {
     setInput((prev) => `${prev}${emoji}`);
   };
@@ -1387,7 +1406,8 @@ export default function ChatPage() {
         room_id: room.id,
         sender_id: userId!,
         sender_nickname: 'Вы',
-        sender_is_admin: Boolean(isAdmin),
+        sender_profile_tag: profileDraft.profile_tag?.trim() || undefined,
+        sender_is_admin: Boolean(isStaff),
         reply_to_message_id: replyToMessageId ?? null,
         content: text,
         nonce: data.nonce ?? encrypted.nonce,
@@ -1412,7 +1432,7 @@ export default function ChatPage() {
     );
     setPreviewCache(room.id, text);
     return true;
-  }, [activePeerPublicKey, ensureGroupRoomKey, setPreviewCache, userId]);
+  }, [activePeerPublicKey, ensureGroupRoomKey, setPreviewCache, userId, isStaff, profileDraft.profile_tag]);
 
   // Отправка сообщения
   const sendMsg = async () => {
@@ -1434,14 +1454,24 @@ export default function ChatPage() {
       await sendEncryptedText(room, text, undefined, replyTo?.id);
       setReplyTo(null);
     } catch (e: unknown) {
-      const err = e as { response?: { status?: number } };
-      if (err.response?.status === 429) {
-        setSendCooldown(true);
-        showToast('Слишком много сообщений. Подожди', 'error');
-        setTimeout(() => setSendCooldown(false), 20_000);
+      if (isAxiosError(e)) {
+        if (e.response?.status === 429) {
+          setSendCooldown(true);
+          showToast('Слишком много сообщений. Подожди', 'error');
+          setTimeout(() => setSendCooldown(false), 20_000);
+        } else if (!e.response) {
+          queueMessageToOutbox(room, text);
+          showToast(
+            'Сервер недоступен (проверьте backend на :8000 и перезапустите Vite после правок прокси). Сообщение в буфере.',
+            'error'
+          );
+        } else {
+          queueMessageToOutbox(room, text);
+          showToast(apiErrorDetail(e, 'Не удалось отправить. Сообщение в буфере'), 'error');
+        }
       } else {
         queueMessageToOutbox(room, text);
-        showToast('Ключи еще не готовы, сообщение ушло в буфер', 'info');
+        showToast('Ключи ещё не готовы или ошибка шифрования — сообщение в буфере', 'info');
       }
     } finally {
       setIsSending(false);
@@ -1799,14 +1829,55 @@ export default function ChatPage() {
   };
 
   const addFriend = async () => {
-    if (!friendUsername.trim()) return;
+    const name = friendUsername.trim();
+    if (!name || friendRequestSubmitting) return;
+    setFriendRequestSubmitting(true);
     try {
-      await friends.sendRequest(friendUsername.trim());
+      await friends.sendRequest(name);
       showToast('Заявка отправлена!', 'success');
       setFriendUsername('');
+      void loadFriendsData();
     } catch (e: unknown) {
-      const err = e as { response?: { data?: { detail?: string } } };
-      showToast(err.response?.data?.detail || 'Ошибка', 'error');
+      if (isAxiosError(e)) {
+        const status = e.response?.status;
+        const detail = apiErrorDetail(e, '');
+        // Второй запрос после успешного часто даёт 409; лимит — 429. Заявка при этом уже создана.
+        if (status === 409) {
+          const lower = detail.toLowerCase();
+          if (
+            lower.includes('уже существует') ||
+            lower.includes('уже друзья') ||
+            lower.includes('нельзя добавить себя')
+          ) {
+            if (lower.includes('уже друзья')) {
+              showToast('Вы уже в друзьях', 'info');
+            } else if (lower.includes('нельзя добавить себя')) {
+              showToast('Нельзя добавить себя в друзья', 'info');
+            } else {
+              showToast('Заявка уже отправлена', 'success');
+            }
+            setFriendUsername('');
+            void loadFriendsData();
+            return;
+          }
+          showToast(detail || 'Не удалось отправить заявку', 'error');
+          return;
+        }
+        if (status === 429) {
+          showToast('Слишком частые запросы. Заявка могла уже уйти — обновляем список.', 'warning');
+          void loadFriendsData();
+          return;
+        }
+        if (!e.response) {
+          showToast('Нет связи с сервером', 'error');
+          return;
+        }
+        showToast(detail || 'Не удалось отправить заявку', 'error');
+      } else {
+        showToast('Не удалось отправить заявку', 'error');
+      }
+    } finally {
+      setFriendRequestSubmitting(false);
     }
   };
 
@@ -1846,34 +1917,66 @@ export default function ChatPage() {
   const profileLabel = profileNickname || (userId != null ? `User #${userId}` : 'Профиль');
   const profileUsernameLabel = profileUsername ? `@${profileUsername}` : '@unknown';
   const profileInitial = profileLabel[0]?.toUpperCase() || 'U';
-  const canManageRoles = myRole === 'super_admin';
-  const canManageUsers = canManageRoles || myPermissions.includes('manage_users');
-  const canBanUsers = canManageRoles || myPermissions.includes('ban_users');
-
+  const partnerProfileTag =
+    selectedRoom?.type === 'direct' && selectedRoom.partner_id != null
+      ? roomMembers.find((m) => m.id === selectedRoom.partner_id)?.profile_tag
+      : undefined;
   const copyProfileUsername = async () => {
     if (!profileUsername) return;
     try {
-      await navigator.clipboard.writeText(`@${profileUsername}`);
-      showToast('Username скопирован', 'success');
+      await navigator.clipboard.writeText(profileUsername);
+      showToast('Логин скопирован (без @)', 'success');
     } catch {
-      showToast('Не удалось скопировать username', 'error');
+      showToast('Не удалось скопировать логин', 'error');
     }
   };
 
   return (
-    <div className={`chat-page ${isMobileView ? 'mobile' : ''} ${isMobileView && selectedRoom ? 'mobile-chat-open' : ''}`}>
+    <div
+      className={`chat-page ${isMobileView ? 'mobile' : ''} ${isMobileView && selectedRoom ? 'mobile-chat-open' : ''} ${isStaff ? 'staff-mode' : ''}`}
+    >
       {/* Левый мини-сайдбар */}
       {(!isMobileView || !selectedRoom) && (
       <div className="left-sidebar">
         <div className="server-icon active" title="MsgHub">M</div>
         <div className="separator"></div>
-        <button className={`nav-btn ${activeMenu === 'chats' ? 'active' : ''}`} onClick={() => setActiveMenu('chats')} title="Чаты">💬</button>
-        <button className={`nav-btn ${activeMenu === 'friends' ? 'active' : ''}`} onClick={() => setActiveMenu('friends')} title="Друзья">👥</button>
-        <button className={`nav-btn ${activeMenu === 'requests' ? 'active' : ''}`} onClick={() => { setActiveMenu('requests'); loadFriendsData(); }} title="Заявки">
-          🔔{friendRequests.length > 0 && <span className={`badge ${friendRequests.length > 0 ? 'pulse' : ''}`}>{friendRequests.length}</span>}
+        <button
+          type="button"
+          className={`nav-btn ${activeMenu === 'chats' ? 'active' : ''} ${chatNavAnim ? 'nav-btn-incoming-pulse' : ''}`}
+          onClick={() => setActiveMenu('chats')}
+          title="Чаты"
+        >
+          💬
         </button>
-        {isAdmin && (
-          <button className={`nav-btn ${activeMenu === 'admin' ? 'active' : ''}`} onClick={() => setActiveMenu('admin')} title="Админ-панель">
+        <button
+          type="button"
+          className={`nav-btn ${activeMenu === 'friends' ? 'active' : ''}`}
+          onClick={() => setActiveMenu('friends')}
+          title="Друзья"
+        >
+          👥
+        </button>
+        <button
+          type="button"
+          className={`nav-btn ${activeMenu === 'requests' ? 'active' : ''} ${requestsNavAnim ? 'nav-btn-incoming-pulse' : ''}`}
+          onClick={() => {
+            setActiveMenu('requests');
+            void loadFriendsData();
+          }}
+          title="Заявки"
+        >
+          🔔
+          {friendRequests.length > 0 && (
+            <span className={`badge ${friendRequests.length > 0 ? 'pulse' : ''}`}>{friendRequests.length}</span>
+          )}
+        </button>
+        {isStaff && (
+          <button
+            type="button"
+            className="nav-btn nav-btn-admin"
+            onClick={() => { window.location.hash = '#/admin'; }}
+            title="Админ-панель"
+          >
             🛡️
           </button>
         )}
@@ -1899,7 +2002,10 @@ export default function ChatPage() {
           >
             <span className="profile-widget-avatar">{profileInitial}</span>
             <span className="profile-widget-meta">
-              <span className="profile-widget-name">{profileLabel}</span>
+              <span className="profile-widget-name">
+                {profileLabel}
+                <ProfileTagBadge tag={profileDraft.profile_tag} />
+              </span>
               <button
                 type="button"
                 className="profile-widget-subname profile-username-copy"
@@ -1907,7 +2013,7 @@ export default function ChatPage() {
                   e.stopPropagation();
                   void copyProfileUsername();
                 }}
-                title="Скопировать @username"
+                title="Скопировать логин (без @, как в поиске)"
               >
                 {profileUsernameLabel}
               </button>
@@ -1985,8 +2091,21 @@ export default function ChatPage() {
             <div className="add-friend-section">
               <label>Добавить друга</label>
               <div className="add-friend-input">
-                <input type="text" placeholder="Username" value={friendUsername} onChange={(e) => setFriendUsername(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addFriend()} />
-                <button onClick={addFriend} className="add-btn">+</button>
+                <input
+                  type="text"
+                  placeholder="Username"
+                  value={friendUsername}
+                  disabled={friendRequestSubmitting}
+                  onChange={(e) => setFriendUsername(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key !== 'Enter') return;
+                    e.preventDefault();
+                    void addFriend();
+                  }}
+                />
+                <button type="button" disabled={friendRequestSubmitting} onClick={() => void addFriend()} className="add-btn">
+                  {friendRequestSubmitting ? '…' : '+'}
+                </button>
               </div>
             </div>
             <div className="friends-section">
@@ -2173,15 +2292,15 @@ export default function ChatPage() {
                 Завершить остальные сессии
               </button>
             </div>
-            {isAdmin && (
+            {isStaff && (
               <div className="settings-section">
                 <h4>Админ-раздел</h4>
                 <div className="setting-item">
                   <span className="setting-label">Моя роль</span>
                   <span className="setting-value">{myRole}</span>
                 </div>
-                <button className="btn-secondary" onClick={() => setActiveMenu('admin')}>
-                  Открыть отдельную админ-панель
+                <button type="button" className="btn-secondary" onClick={() => { window.location.hash = '#/admin'; }}>
+                  Открыть админ-панель
                 </button>
               </div>
             )}
@@ -2209,130 +2328,6 @@ export default function ChatPage() {
           </div>
         )}
 
-        {activeMenu === 'admin' && isAdmin && (
-          <div className="content-panel settings-panel">
-            <div className="settings-section">
-              <h4>Админ-панель</h4>
-              <div className="setting-item">
-                <span className="setting-label">Мои permissions</span>
-                <span className="setting-value">{myPermissions.join(', ') || 'нет'}</span>
-              </div>
-              <div className="setting-item">
-                <span className="setting-label">Моя роль</span>
-                <span className="setting-value">{myRole}</span>
-              </div>
-              <div className="setting-item">
-                <span className="setting-label">Режим</span>
-                <span className="setting-value">{canManageRoles ? 'SUPER_ADMIN' : 'MODERATOR'}</span>
-              </div>
-              {adminOverview && (
-                <>
-                  <div className="setting-item">
-                    <span className="setting-label">Всего пользователей</span>
-                    <span className="setting-value">{adminOverview.users_total}</span>
-                  </div>
-                  <div className="setting-item">
-                    <span className="setting-label">Забаненных</span>
-                    <span className="setting-value">{adminOverview.banned_total}</span>
-                  </div>
-                </>
-              )}
-            </div>
-            <div className="settings-section">
-              <h4>Пользователи</h4>
-              {!canManageRoles && (
-                <div className="setting-item">
-                  <span className="setting-label">Модераторский режим: доступны ban/unban, просмотр логов.</span>
-                </div>
-              )}
-              {adminUsers.map((u) => (
-                <div className="setting-item" key={`admin-panel-user-${u.id}`} style={{ alignItems: 'stretch', flexDirection: 'column' }}>
-                  <span className="setting-label">
-                    #{u.id} {u.nickname} (@{u.username}) {adminBadge(u.is_admin, u.role)} {u.profile_tag ? `· [${u.profile_tag}]` : ''}
-                  </span>
-                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
-                    {canManageRoles && (
-                      <>
-                        <button className="btn-secondary" onClick={async () => { await auth.adminSetRole(u.id, 'user'); const r = await auth.adminListUsers(); setAdminUsers(r.data || []); }}>user</button>
-                        <button className="btn-secondary" onClick={async () => { await auth.adminSetRole(u.id, 'moderator'); const r = await auth.adminListUsers(); setAdminUsers(r.data || []); }}>moderator</button>
-                        <button className="btn-secondary" onClick={async () => { await auth.adminSetRole(u.id, 'super_admin'); const r = await auth.adminListUsers(); setAdminUsers(r.data || []); }}>super</button>
-                      </>
-                    )}
-                    {canBanUsers && (
-                      <>
-                        <button className="btn-secondary" onClick={async () => { await auth.adminBan(u.id); const r = await auth.adminListUsers(); setAdminUsers(r.data || []); }}>ban</button>
-                        <button className="btn-secondary" onClick={async () => { await auth.adminUnban(u.id); const r = await auth.adminListUsers(); setAdminUsers(r.data || []); }}>unban</button>
-                      </>
-                    )}
-                    {canManageUsers && (
-                      <>
-                        <button
-                          className="btn-secondary"
-                          onClick={async () => {
-                            try {
-                              const tag = (adminTagDraftByUser[u.id] ?? '').trim();
-                              await auth.adminSetUserTag(u.id, tag);
-                              const r = await auth.adminListUsers();
-                              setAdminUsers(r.data || []);
-                              showToast('Тег обновлен', 'success');
-                            } catch (e) {
-                              showToast(apiErrorDetail(e, 'Не удалось обновить тег'), 'error');
-                            }
-                          }}
-                        >
-                          сохранить тег
-                        </button>
-                        <button
-                          className="btn-secondary danger"
-                          onClick={async () => {
-                            if (!window.confirm(`Удалить аккаунт @${u.username}?`)) return;
-                            try {
-                              await auth.adminDeleteUser(u.id);
-                              const r = await auth.adminListUsers();
-                              setAdminUsers(r.data || []);
-                              showToast('Аккаунт удален', 'success');
-                            } catch (e) {
-                              showToast(apiErrorDetail(e, 'Не удалось удалить аккаунт'), 'error');
-                            }
-                          }}
-                        >
-                          удалить аккаунт
-                        </button>
-                      </>
-                    )}
-                  </div>
-                  {canManageUsers && (
-                    <input
-                      className="profile-input"
-                      placeholder="Тег пользователя"
-                      value={adminTagDraftByUser[u.id] ?? ''}
-                      onChange={(e) => setAdminTagDraftByUser((prev) => ({ ...prev, [u.id]: e.target.value }))}
-                      style={{ marginTop: 8 }}
-                    />
-                  )}
-                </div>
-              ))}
-            </div>
-            <div className="settings-section">
-              <h4>Audit log</h4>
-              {adminLogs.slice(0, 12).map((log) => (
-                <div className="setting-item" key={`admin-tab-alog-${log.id}`}>
-                  <span className="setting-label">
-                    {new Date(log.created_at).toLocaleString('ru-RU')} · {log.action}
-                  </span>
-                </div>
-              ))}
-              <h4 style={{ marginTop: 16 }}>Security events</h4>
-              {securityEvents.slice(0, 12).map((evt) => (
-                <div className="setting-item" key={`admin-tab-sevt-${evt.id}`}>
-                  <span className="setting-label">
-                    {new Date(evt.created_at).toLocaleString('ru-RU')} · {evt.event_type} · {evt.severity}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
       </div>
       )}
 
@@ -2349,7 +2344,10 @@ export default function ChatPage() {
                 )}
                 <span className="chat-icon">{selectedRoom.type === 'direct' ? '👤' : '#'}</span>
                 <div className="header-info">
-                  <h3>{selectedRoom.type === 'direct' ? getDirectRoomName(selectedRoom) : selectedRoom.name}</h3>
+                  <h3>
+                    {selectedRoom.type === 'direct' ? getDirectRoomName(selectedRoom) : selectedRoom.name}
+                    {selectedRoom.type === 'direct' && <ProfileTagBadge tag={partnerProfileTag} />}
+                  </h3>
                   <p className="chat-subtitle">
                     {selectedRoom.type === 'direct'
                       ? (selectedRoom.partner_username
@@ -2420,12 +2418,8 @@ export default function ChatPage() {
                       onClick={() => {
                         const partnerId = selectedRoom.partner_id;
                         if (!partnerId) return;
-                        const current = getAlias(partnerId) || '';
-                        const nextAlias = window.prompt('Локальный псевдоним для пользователя', current);
-                        if (nextAlias == null) return;
-                        setLocalAlias(partnerId, nextAlias);
-                        showToast('Локальный псевдоним сохранен', 'success');
-                        setMyRooms((prev) => [...prev]);
+                        setAliasPromptPartnerId(partnerId);
+                        setShowAliasPrompt(true);
                         setShowRoomMenu(false);
                       }}
                     >
@@ -2532,6 +2526,7 @@ export default function ChatPage() {
                           ? 'Вы'
                           : preferAlias(Number(msg.sender_id), msg.sender_nickname || `User #${msg.sender_id}`)}
                         {' '}
+                        <ProfileTagBadge tag={msg.sender_profile_tag} />
                         {adminBadge(Boolean(msg.sender_is_admin))}
                       </span>
                       <span className="msg-time">
@@ -2909,6 +2904,28 @@ export default function ChatPage() {
           </div>
         </div>
       )}
+
+      <PromptDialog
+        open={showAliasPrompt && aliasPromptPartnerId != null}
+        title="Локальный псевдоним"
+        label="Псевдоним для этого чата (только у вас)"
+        defaultValue={aliasPromptPartnerId != null ? getAlias(aliasPromptPartnerId) || '' : ''}
+        placeholder="Например: коллега"
+        submitLabel="Сохранить"
+        cancelLabel="Отмена"
+        onCancel={() => {
+          setShowAliasPrompt(false);
+          setAliasPromptPartnerId(null);
+        }}
+        onSubmit={(val) => {
+          if (aliasPromptPartnerId == null) return;
+          setLocalAlias(aliasPromptPartnerId, val);
+          showToast('Локальный псевдоним сохранён', 'success');
+          setMyRooms((prev) => [...prev]);
+          setShowAliasPrompt(false);
+          setAliasPromptPartnerId(null);
+        }}
+      />
     </div>
   );
 }

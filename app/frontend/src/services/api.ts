@@ -116,6 +116,8 @@ export interface Message {
   room_id: number;
   sender_id: number;
   sender_nickname?: string;
+  /** Глобальный тег профиля (назначает админ), виден везде в UI */
+  sender_profile_tag?: string | null;
   sender_is_admin?: boolean;
   sender_device_id?: string | null;
   reply_to_message_id?: number | null;
@@ -228,6 +230,7 @@ export interface RoomMemberInfo {
   nickname: string;
   username: string;
   is_admin?: boolean;
+  profile_tag?: string | null;
 }
 
 export interface E2EPublicKeyResponse {
@@ -324,6 +327,9 @@ export const auth = {
   updateMe: (payload: Partial<Pick<User, 'nickname' | 'email' | 'avatar_url' | 'status_message' | 'profile_tag'>>) =>
     api.patch<User>('/auth/me', payload),
   adminListUsers: () => api.get<User[]>('/auth/admin/users'),
+  /** Тот же endpoint, что и список, с query `q` — поиск (см. backend). */
+  adminSearchUsers: (q: string, limit = 50) =>
+    api.get<User[]>('/auth/admin/users', { params: { q, limit } }),
   adminGrant: (userId: number) => api.post<User>(`/auth/admin/users/${userId}/grant-admin`, {}),
   adminRevoke: (userId: number) => api.post<User>(`/auth/admin/users/${userId}/revoke-admin`, {}),
   adminBan: (userId: number) => api.post<User>(`/auth/admin/users/${userId}/ban`, {}),

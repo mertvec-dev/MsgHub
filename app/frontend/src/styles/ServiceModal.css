@@ -1,0 +1,180 @@
+/* Общие модалки (подтверждение, ввод) — без нативных alert/confirm/prompt */
+
+.srv-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+  animation: srv-modal-fade 0.2s ease;
+}
+
+@keyframes srv-modal-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.srv-modal {
+  background: #1e1e36;
+  border-radius: 12px;
+  width: 440px;
+  max-width: 92vw;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+  border: 1px solid #2a2a4a;
+  animation: srv-modal-slide 0.25s ease;
+}
+
+.srv-modal-sm {
+  width: 380px;
+}
+
+@keyframes srv-modal-slide {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.srv-modal-header {
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid #2a2a4a;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.srv-modal-header h2 {
+  margin: 0;
+  font-size: 17px;
+  color: #fff;
+  font-weight: 600;
+}
+
+.srv-modal-close {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: #888;
+  font-size: 20px;
+  cursor: pointer;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s, color 0.2s;
+}
+
+.srv-modal-close:hover {
+  background: rgba(244, 67, 54, 0.15);
+  color: #f44336;
+}
+
+.srv-modal-body {
+  padding: 18px 20px;
+  overflow-y: auto;
+}
+
+.srv-modal-text {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #c8c8d8;
+}
+
+.srv-modal-body .srv-form-group {
+  margin-bottom: 0;
+}
+
+.srv-modal-body .srv-form-group label {
+  display: block;
+  font-size: 11px;
+  color: #888;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.srv-modal-body .srv-form-group input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 11px 14px;
+  border-radius: 8px;
+  border: 1px solid #2a2a4a;
+  background: #16162a;
+  color: #e8e8f0;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.srv-modal-body .srv-form-group input:focus {
+  border-color: #6c63ff;
+}
+
+.srv-modal-footer {
+  padding: 14px 20px 18px;
+  border-top: 1px solid #2a2a4a;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.srv-btn {
+  padding: 0 20px;
+  min-height: 40px;
+  border-radius: 8px;
+  border: none;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+}
+
+.srv-btn-secondary {
+  background: #2a2a4a;
+  color: #c8c8d8;
+}
+
+.srv-btn-secondary:hover {
+  background: #3a3a5a;
+  color: #fff;
+}
+
+.srv-btn-primary {
+  background: linear-gradient(135deg, #6c63ff, #5a52d5);
+  color: #fff;
+}
+
+.srv-btn-primary:hover {
+  filter: brightness(1.08);
+}
+
+.srv-btn-danger {
+  background: rgba(244, 67, 54, 0.22);
+  border: 1px solid rgba(244, 67, 54, 0.55);
+  color: #ff8a80;
+}
+
+.srv-btn-danger:hover {
+  background: rgba(244, 67, 54, 0.35);
+  color: #fff;
+}

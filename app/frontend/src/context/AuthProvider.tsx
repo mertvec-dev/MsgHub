@@ -1,9 +1,16 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { ReactNode } from 'react';
-import { auth, setAccessToken } from '../services/api';
+import { auth, setAccessToken, getAccessToken, type User } from '../services/api';
 import { userIdFromAuthPayload } from './authHelpers';
 import { AuthContext } from './authContextObject';
 const PROFILE_CACHE_KEY = 'msghub-profile-v1';
+
+/** Доступ к админ-разделу: флаг или роль staff (на случай рассинхрона is_admin). */
+function userHasStaffAccess(me: User): boolean {
+  if (me.is_admin) return true;
+  const r = me.role;
+  return r === 'moderator' || r === 'super_admin';
+}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(null);
@@ -11,6 +18,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [profileNickname, setProfileNickname] = useState<string | null>(null);
   const [profileUsername, setProfileUsername] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [isStaff, setIsStaff] = useState(false);
+  const [userRole, setUserRole] = useState<'user' | 'moderator' | 'super_admin' | null>(null);
 
   const saveProfile = useCallback((nickname: string | null, username: string | null) => {
     setProfileNickname(nickname);
@@ -46,6 +55,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setToken(null);
     setUserId(null);
     setIsAdmin(false);
+    setIsStaff(false);
+    setUserRole(null);
     saveProfile(null, null);
   }, [saveProfile]);
 
@@ -57,6 +68,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setAccessToken(d.access_token);
       setToken(d.access_token);
       setUserId(userIdFromAuthPayload(d));
+      void auth.getMe().then((res) => {
+        const staff = userHasStaffAccess(res.data);
+        setIsAdmin(staff);
+        setIsStaff(staff);
+        setUserRole(res.data.role ?? null);
+      }).catch(() => {});
     };
     const onAuthFailed = () => logout();
     window.addEventListener('msghub:tokens-refreshed', onTokensRefreshed);
@@ -68,12 +85,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [logout]);
 
   useEffect(() => {
-    auth.refresh().catch(() => {
-      setAccessToken(null);
-      setToken(null);
-      setUserId(null);
-    });
-  }, []);
+    void (async () => {
+      try {
+        await auth.refresh();
+        const me = await auth.getMe();
+        saveProfile(me.data.nickname, me.data.username);
+        setUserId(me.data.id);
+        const staff = userHasStaffAccess(me.data);
+        setIsAdmin(staff);
+        setIsStaff(staff);
+        setUserRole(me.data.role ?? null);
+        setToken(getAccessToken());
+      } catch {
+        setAccessToken(null);
+        setToken(null);
+        setUserId(null);
+        setIsAdmin(false);
+        setIsStaff(false);
+        setUserRole(null);
+      }
+    })();
+  }, [saveProfile]);
 
   const login = useCallback(
     async (username: string, password: string) => {
@@ -83,7 +115,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUserId(userIdFromAuthPayload(data));
       const me = await auth.getMe();
       saveProfile(me.data.nickname, me.data.username);
-      setIsAdmin(Boolean(me.data.is_admin));
+      const staff = userHasStaffAccess(me.data);
+      setIsAdmin(staff);
+      setIsStaff(staff);
+      setUserRole(me.data.role ?? null);
     },
     [saveProfile]
   );
@@ -96,14 +131,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUserId(userIdFromAuthPayload(data));
       const me = await auth.getMe();
       saveProfile(me.data.nickname, me.data.username);
-      setIsAdmin(Boolean(me.data.is_admin));
+      const staff = userHasStaffAccess(me.data);
+      setIsAdmin(staff);
+      setIsStaff(staff);
+      setUserRole(me.data.role ?? null);
     },
     [saveProfile]
   );
 
   return (
     <AuthContext.Provider
-      value={{ userId, token, profileNickname, profileUsername, isAdmin, login, register, logout }}
+      value={{
+        userId,
+        token,
+        profileNickname,
+        profileUsername,
+        isAdmin,
+        isStaff,
+        userRole,
+        login,
+        register,
+        logout,
+      }}
     >
       {children}
     </AuthContext.Provider>
