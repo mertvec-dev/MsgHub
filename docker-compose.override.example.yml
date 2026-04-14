@@ -10,4 +10,6 @@ services:
       - /etc/letsencrypt:/etc/letsencrypt:ro
       # Опционально: статика с диска вместо встроенной в образ Dockerfile.nginx
       # (тогда на ВМ нужен npm run build в app/frontend и эта папка)
+      # ВНИМАНИЕ: если volume включён, docker compose build nginx НЕ обновит сайт —
+      # обновляйте dist вручную или отключите mount.
       # - ./app/frontend/dist:/usr/share/nginx/html:ro

@@ -9,6 +9,7 @@ from fastapi import FastAPI
 
 from app.backend.services import pubsub
 from database.engine import db_engine
+from database.migrations_runner import run_alembic_upgrade_head
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,9 @@ async def app_lifespan(_: FastAPI) -> AsyncIterator[None]:
     - закрывает пул БД.
     """
     logger.info("Запуск MsgHub Backend...")
+    # Alembic вызывает asyncio.run() внутри env.py — запускаем в отдельном потоке,
+    # чтобы не конфликтовать с текущим event loop FastAPI.
+    await asyncio.to_thread(run_alembic_upgrade_head)
     await db_engine.init_db()
     logger.info("База данных готова")
 

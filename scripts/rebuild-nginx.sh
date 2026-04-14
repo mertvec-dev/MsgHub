@@ -6,11 +6,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 echo "==> Сборка Dockerfile.nginx (CACHEBUST сбрасывает кэш слоя npm run build)..."
-docker build \
-  -f Dockerfile.nginx \
-  -t msghub-nginx:latest \
-  --build-arg "CACHEBUST=$(date +%s)" \
-  .
+export GIT_REVISION="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+export CACHEBUST="$(date +%s)"
+docker compose build nginx --no-cache
 
 echo "==> Перезапуск контейнера nginx с новым образом..."
 docker compose up -d --force-recreate nginx

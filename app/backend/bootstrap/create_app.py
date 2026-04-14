@@ -36,6 +36,11 @@ def create_app() -> FastAPI:
     app.include_router(rooms.router)
     app.include_router(messages.router)
 
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        """Проверка деплоя бэкенда (проксируется из nginx: GET /health)."""
+        return {"status": "ok", "service": "msghub-backend", "revision": settings.MSGHUB_REVISION}
+
     @app.get("/")
     async def root() -> dict[str, str]:
         """Проверка работоспособности API."""

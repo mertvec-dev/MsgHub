@@ -11,4 +11,9 @@ ARG CACHEBUST=1
 RUN echo "cachebust=${CACHEBUST}" && npm run build
 
 FROM nginx:1.27-alpine
+ARG GIT_REVISION=unknown
 COPY --from=frontend-build /app/dist /usr/share/nginx/html
+# Видно снаружи: curl -sS https://<домен>/msghub-build.json
+RUN BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" && \
+    printf '{"service":"msghub-frontend","git":"%s","built_at":"%s"}\n' \
+      "${GIT_REVISION}" "${BUILT_AT}" > /usr/share/nginx/html/msghub-build.json

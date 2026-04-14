@@ -71,6 +71,8 @@ class Settings(BaseSettings):
 
     # ─── Общее ───
     PROJECT_NAME: str = "MsgHub"
+    # Произвольная метка деплоя (подставьте в .env на сервере — видна в GET /health)
+    MSGHUB_REVISION: str = "unknown"
 
     # ─── База данных (PostgreSQL) ───
     POSTGRES_USER: str

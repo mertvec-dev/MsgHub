@@ -56,10 +56,16 @@ services:
       - msghub_network
     restart: unless-stopped # Перезапуск контейнера при сбое
   
+  # Фронт внутри образа: после git pull пересоберите nginx (не только backend).
+  # Пример принудительной пересборки слоя Vite: CACHEBUST=$(date +%s) docker compose build nginx --no-cache
+  # или bash scripts/rebuild-nginx.sh
   nginx: # Nginx + встроенная сборка фронта (см. Dockerfile.nginx)
     build:
       context: .
       dockerfile: Dockerfile.nginx
+      args:
+        CACHEBUST: ${CACHEBUST:-1}
+        GIT_REVISION: ${GIT_REVISION:-unknown}
     image: msghub-nginx:latest
     container_name: msghub_nginx
     ports:
