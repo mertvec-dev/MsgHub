@@ -1,0 +1,14 @@
+# Статика фронта встроена в образ: после правок UI пересоберите nginx
+# (docker compose build nginx --no-cache && docker compose up -d nginx).
+# На ВМ: bash scripts/rebuild-nginx.sh  — если «No services to build» от docker compose.
+FROM node:20-alpine AS frontend-build
+WORKDIR /app
+COPY app/frontend/package.json app/frontend/package-lock.json ./
+RUN npm ci
+COPY app/frontend/ ./
+# Сбрасывает кэш слоя со сборкой Vite при явной передаче: --build-arg CACHEBUST=$(date +%s)
+ARG CACHEBUST=1
+RUN echo "cachebust=${CACHEBUST}" && npm run build
+
+FROM nginx:1.27-alpine
+COPY --from=frontend-build /app/dist /usr/share/nginx/html

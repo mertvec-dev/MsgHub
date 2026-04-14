@@ -529,6 +529,7 @@ class RoomService:
                     "nickname": member.nickname,
                     "username": member.username,
                     "is_admin": bool(member.is_admin),
+                    "profile_tag": member.profile_tag,
                     "muted_until": getattr(member, "muted_until", None),
                     "muted_reason": getattr(member, "muted_reason", None),
                 }

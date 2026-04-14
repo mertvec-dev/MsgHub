@@ -20,7 +20,7 @@ from app.backend.utils.rate_limiter import limiter
 from app.backend.config import settings
 
 # Получение user_id из JWT-токена
-from app.backend.utils.jwt_utils import get_current_user
+from app.backend.utils.jwt_utils import require_active_user
 
 # WebSocket менеджер — для отображения онлайн-статуса
 from app.backend.websocket import manager
@@ -43,7 +43,7 @@ router = APIRouter(prefix="/friends", tags=["friends"])
     description="Создаёт заявку со статусом 'pending'"
 )
 @limiter.limit(settings.RATE_LIMIT_FRIEND_REQUEST)
-async def send_request(request: Request, data: FriendRequest, user_id: int = Depends(get_current_user)):
+async def send_request(request: Request, data: FriendRequest, user_id: int = Depends(require_active_user)):
     """
     Принимает username пользователя, которому хотим отправить заявку
     Сервис ищет пользователя по username, проверяет что не себе и не дубликат
@@ -67,7 +67,7 @@ async def send_request(request: Request, data: FriendRequest, user_id: int = Dep
     description="Меняет статус заявки на 'accepted'"
 )
 @limiter.limit(settings.RATE_LIMIT_FRIEND_REQUEST)
-async def accept_request(request: Request, request_id: int, user_id: int = Depends(get_current_user)):
+async def accept_request(request: Request, request_id: int, user_id: int = Depends(require_active_user)):
     """
     Принимает входящую заявку.
     Проверяет что текущий пользователь — получатель заявки.
@@ -115,7 +115,7 @@ async def accept_request(request: Request, request_id: int, user_id: int = Depen
     description="Удаляет заявку из БД"
 )
 @limiter.limit(settings.RATE_LIMIT_FRIEND_REQUEST)
-async def decline_request(request: Request, request_id: int, user_id: int = Depends(get_current_user)):
+async def decline_request(request: Request, request_id: int, user_id: int = Depends(require_active_user)):
     """
     Отклоняет входящую заявку.
     Проверяет что текущий пользователь — получатель заявки.
@@ -149,7 +149,7 @@ async def decline_request(request: Request, request_id: int, user_id: int = Depe
     description="Помечает связь как blocked; повторные заявки от этой стороны невозможны",
 )
 @limiter.limit(settings.RATE_LIMIT_FRIEND_BLOCK)
-async def block_user(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
+async def block_user(request: Request, target_user_id: int, user_id: int = Depends(require_active_user)):
     await friends_service.block_user(user_id, target_user_id)
     affected_room_ids = await friends_service.enforce_block_for_direct_chat(user_id, target_user_id)
     payload_for_actor = {
@@ -183,7 +183,7 @@ async def block_user(request: Request, target_user_id: int, user_id: int = Depen
     description="Удаляет пользователя из вашего ЧС",
 )
 @limiter.limit(settings.RATE_LIMIT_FRIEND_BLOCK)
-async def unblock_user(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
+async def unblock_user(request: Request, target_user_id: int, user_id: int = Depends(require_active_user)):
     await friends_service.unblock_user(user_id, target_user_id)
     payload = {
         "action": "friends_sync",
@@ -201,7 +201,7 @@ async def unblock_user(request: Request, target_user_id: int, user_id: int = Dep
     summary="Удалить из друзей",
     description="Удаляет запись о дружбе из БД"
 )
-async def remove_friend(friend_id: int, user_id: int = Depends(get_current_user)):
+async def remove_friend(friend_id: int, user_id: int = Depends(require_active_user)):
     """
     Полностью удаляет связь дружбы (обе записи — sender и receiver).
     """
@@ -232,7 +232,7 @@ async def remove_friend(friend_id: int, user_id: int = Depends(get_current_user)
     summary="Список друзей и заявок",
     description="Возвращает все записи дружбы текущего пользователя"
 )
-async def get_friends(user_id: int = Depends(get_current_user)):
+async def get_friends(user_id: int = Depends(require_active_user)):
     """
     Возвращает все записи Friendship, где участвует текущий пользователь.
     Это включает:

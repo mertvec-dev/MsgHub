@@ -40,7 +40,8 @@ class MessageResponse(BaseModel):
     room_id: int
     sender_id: int
     sender_device_id: Optional[str] = None
-    sender_nickname: str 
+    sender_nickname: str
+    sender_profile_tag: Optional[str] = None
     content: str
     nonce: str
     key_version: int

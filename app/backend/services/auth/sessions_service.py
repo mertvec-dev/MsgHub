@@ -10,6 +10,7 @@ from app.backend.config import settings
 from app.backend.utils.jwt_utils import create_access_token
 from database.engine import db_engine
 from database.models.sessions import Session as SessionModel
+from database.models.users import User
 from database.redis import redis_client
 
 
@@ -45,6 +46,10 @@ class SessionsService:
                 raise ValueError("Сессия недействительна")
 
             user_id = int(db_session.user_id)
+            user_res = await session.execute(select(User).where(User.id == user_id))
+            user_row = user_res.scalars().first()
+            if not user_row or user_row.is_banned or not user_row.is_active:
+                raise ValueError("Аккаунт заблокирован")
             old_device_id = db_session.device_id
             old_device_info = db_session.device_info
             old_ip = db_session.ip_address

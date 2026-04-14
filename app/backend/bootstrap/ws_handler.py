@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.backend.utils.jwt_utils import verify_token
+from app.backend.services.auth_service import auth_service
 from app.backend.websocket import manager
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         if not user_id:
             await websocket.close(code=4001)
             return
+
+        try:
+            uid = int(user_id)
+        except (TypeError, ValueError):
+            await websocket.close(code=4001)
+            return
+
+        user = await auth_service.get_me(uid)
+        if user.is_banned or not user.is_active:
+            logger.warning("WebSocket: заблокированный пользователь uid=%s", uid)
+            await websocket.close(code=4003)
+            return
+
+        user_id = uid
 
         await manager.connect(websocket, user_id)
         logger.info("WebSocket подключился: user_id=%s", user_id)

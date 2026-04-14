@@ -2,8 +2,12 @@
 Роутер аутентификации — регистрация, вход, сессии, выход
 """
 
+import logging
+
 # ИМПОРТЫ — стандартные библиотеки, сторонние, внутренние
 from fastapi import APIRouter, HTTPException, status, Depends, Request, Response
+
+logger = logging.getLogger(__name__)
 
 # Pydantic-схемы для валидации запросов/ответов
 from app.backend.schemas.auth import (
@@ -43,7 +47,7 @@ from app.backend.services.friends_service import friends_service
 from app.backend.services.e2e_orchestrator import e2e_orchestrator
 
 # Получение user_id из JWT-токена
-from app.backend.utils.jwt_utils import get_current_user
+from app.backend.utils.jwt_utils import require_active_user
 
 # Настройки (лимиты rate limiting)
 from app.backend.config import settings
@@ -249,7 +253,7 @@ async def logout(request: Request, response: Response):
     summary="Список активных сессий",
     description="Все сессии текущего пользователя (устройства, IP, время)"
 )
-async def get_sessions(user_id: int = Depends(get_current_user)):
+async def get_sessions(user_id: int = Depends(require_active_user)):
     """
     Возвращает все активные сессии пользователя.
     Нужно для того, чтобы юзер видел, с каких устройств он залогинен.
@@ -268,7 +272,7 @@ async def get_sessions(user_id: int = Depends(get_current_user)):
     response_model=RevokeSessionResponse,
     summary="Завершить конкретную сессию",
 )
-async def revoke_session(session_id: int, user_id: int = Depends(get_current_user)):
+async def revoke_session(session_id: int, user_id: int = Depends(require_active_user)):
     ok = await auth_service.revoke_session(user_id, session_id)
     if not ok:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Сессия не найдена")
@@ -280,7 +284,7 @@ async def revoke_session(session_id: int, user_id: int = Depends(get_current_use
     response_model=RevokeSessionResponse,
     summary="Завершить все сессии кроме текущей",
 )
-async def revoke_other_sessions(request: Request, user_id: int = Depends(get_current_user)):
+async def revoke_other_sessions(request: Request, user_id: int = Depends(require_active_user)):
     refresh_token = request.cookies.get("refresh_token")
     if not refresh_token:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Refresh токен отсутствует")
@@ -301,7 +305,7 @@ async def revoke_other_sessions(request: Request, user_id: int = Depends(get_cur
     response_model=ProfileResponse,
     summary="Текущий профиль",
 )
-async def get_me(user_id: int = Depends(get_current_user)):
+async def get_me(user_id: int = Depends(require_active_user)):
     user = await auth_service.get_me(user_id)
     return ProfileResponse.model_validate(user)
 
@@ -311,7 +315,7 @@ async def get_me(user_id: int = Depends(get_current_user)):
     response_model=ProfileResponse,
     summary="Обновить профиль",
 )
-async def update_me(data: ProfileUpdateRequest, user_id: int = Depends(get_current_user)):
+async def update_me(data: ProfileUpdateRequest, user_id: int = Depends(require_active_user)):
     user = await auth_service.update_me(user_id, data.model_dump(exclude_none=True))
     return ProfileResponse.model_validate(user)
 
@@ -321,7 +325,7 @@ async def update_me(data: ProfileUpdateRequest, user_id: int = Depends(get_curre
     summary="Обновление публичного ключа E2E",
     description="Обновляет публичный ключ E2E для текущего пользователя"
 )
-async def upsert_public_key(data: E2EKeyRequest, user_id: int = Depends(get_current_user)):
+async def upsert_public_key(data: E2EKeyRequest, user_id: int = Depends(require_active_user)):
     """
     Обновляет публичный ключ E2E для текущего пользователя.
     """
@@ -367,7 +371,7 @@ async def get_public_key(user_id: int):
 )
 async def upsert_device_public_key(
     data: DevicePublicKeyRequest,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     try:
         item = await auth_service.upsert_device_public_key(
@@ -396,7 +400,7 @@ async def upsert_device_public_key(
     response_model=PeerDeviceKeysResponse,
     summary="Получить ключи устройств собеседника",
 )
-async def get_peer_device_keys(peer_user_id: int, user_id: int = Depends(get_current_user)):
+async def get_peer_device_keys(peer_user_id: int, user_id: int = Depends(require_active_user)):
     try:
         devices = await auth_service.get_peer_device_keys(user_id, peer_user_id)
         return PeerDeviceKeysResponse(
@@ -422,7 +426,7 @@ async def get_peer_device_keys(peer_user_id: int, user_id: int = Depends(get_cur
 )
 async def get_direct_e2e_readiness(
     peer_user_id: int,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     """
     Возвращает проверенный backend-статус E2E readiness для direct-чата.
@@ -434,17 +438,34 @@ async def get_direct_e2e_readiness(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
-@router.get("/admin/users", response_model=list[ProfileResponse], summary="Список пользователей (admin)")
-async def admin_list_users(user_id: int = Depends(get_current_user)):
+@router.get(
+    "/admin/users",
+    response_model=list[ProfileResponse],
+    summary="Список или поиск пользователей (admin)",
+)
+async def admin_list_users(
+    q: str | None = None,
+    limit: int = 50,
+    user_id: int = Depends(require_active_user),
+):
+    """
+    Без `q` — полный список. С непустым `q` — поиск (ник/username/тег/id).
+    Поиск не вынесен в отдельный путь `/search`, чтобы не пересекаться с `/admin/users/{id}`.
+    """
     try:
-        users = await auth_service.list_users_admin(user_id)
+        if q is not None and q.strip():
+            users = await auth_service.search_users_admin(
+                user_id, q.strip(), limit=min(max(limit, 1), 100)
+            )
+        else:
+            users = await auth_service.list_users_admin(user_id)
         return [ProfileResponse.model_validate(u) for u in users]
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
 
 @router.post("/admin/users/{target_user_id}/grant-admin", response_model=ProfileResponse, summary="Выдать admin")
-async def admin_grant(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
+async def admin_grant(request: Request, target_user_id: int, user_id: int = Depends(require_active_user)):
     try:
         user = await auth_service.set_admin(user_id, target_user_id, True)
         await audit_log_service.log_admin_action(
@@ -464,7 +485,7 @@ async def admin_grant(request: Request, target_user_id: int, user_id: int = Depe
 
 
 @router.post("/admin/users/{target_user_id}/revoke-admin", response_model=ProfileResponse, summary="Снять admin")
-async def admin_revoke(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
+async def admin_revoke(request: Request, target_user_id: int, user_id: int = Depends(require_active_user)):
     try:
         user = await auth_service.set_admin(user_id, target_user_id, False)
         await audit_log_service.log_admin_action(
@@ -484,7 +505,7 @@ async def admin_revoke(request: Request, target_user_id: int, user_id: int = Dep
 
 
 @router.post("/admin/users/{target_user_id}/ban", response_model=ProfileResponse, summary="Бан пользователя")
-async def admin_ban(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
+async def admin_ban(request: Request, target_user_id: int, user_id: int = Depends(require_active_user)):
     try:
         user = await auth_service.set_ban(user_id, target_user_id, True)
         await audit_log_service.log_admin_action(
@@ -504,7 +525,7 @@ async def admin_ban(request: Request, target_user_id: int, user_id: int = Depend
 
 
 @router.post("/admin/users/{target_user_id}/unban", response_model=ProfileResponse, summary="Разбан пользователя")
-async def admin_unban(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
+async def admin_unban(request: Request, target_user_id: int, user_id: int = Depends(require_active_user)):
     try:
         user = await auth_service.set_ban(user_id, target_user_id, False)
         await audit_log_service.log_admin_action(
@@ -524,7 +545,7 @@ async def admin_unban(request: Request, target_user_id: int, user_id: int = Depe
 
 
 @router.post("/admin/users/{target_user_id}/deactivate", response_model=ProfileResponse, summary="Деактивация аккаунта")
-async def admin_deactivate(request: Request, target_user_id: int, user_id: int = Depends(get_current_user)):
+async def admin_deactivate(request: Request, target_user_id: int, user_id: int = Depends(require_active_user)):
     try:
         user = await auth_service.set_active(user_id, target_user_id, False)
         await audit_log_service.log_admin_action(
@@ -544,7 +565,7 @@ async def admin_deactivate(request: Request, target_user_id: int, user_id: int =
 
 
 @router.get("/admin/overview", response_model=AdminOverviewResponse, summary="Сводка для admin-панели")
-async def admin_overview(user_id: int = Depends(get_current_user)):
+async def admin_overview(user_id: int = Depends(require_active_user)):
     try:
         data = await auth_service.get_admin_overview(user_id)
         return AdminOverviewResponse(**data)
@@ -557,7 +578,7 @@ async def admin_set_role(
     request: Request,
     target_user_id: int,
     payload: RoleUpdateRequest,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     try:
         user = await auth_service.set_role(user_id, target_user_id, payload.role)
@@ -583,7 +604,7 @@ async def admin_grant_permission(
     request: Request,
     target_user_id: int,
     payload: PermissionUpdateRequest,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     try:
         await auth_service.grant_permission(user_id, target_user_id, payload.permission)
@@ -609,7 +630,7 @@ async def admin_revoke_permission(
     request: Request,
     target_user_id: int,
     payload: PermissionUpdateRequest,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     try:
         await auth_service.revoke_permission(user_id, target_user_id, payload.permission)
@@ -635,7 +656,7 @@ async def admin_set_user_tag(
     request: Request,
     target_user_id: int,
     payload: AdminTagUpdateRequest,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     try:
         user = await auth_service.set_user_profile_tag(user_id, target_user_id, payload.profile_tag)
@@ -660,34 +681,39 @@ async def admin_set_user_tag(
 async def admin_delete_user(
     request: Request,
     target_user_id: int,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     try:
         await auth_service.delete_user_account(user_id, target_user_id)
+        # После удаления строки users нельзя вставить audit с FK target_user_id — только NULL + details.
         await audit_log_service.log_admin_action(
             actor_user_id=user_id,
-            target_user_id=target_user_id,
+            target_user_id=None,
             action="delete_user",
+            details=f"deleted_user_id={target_user_id}",
             ip_address=request.client.host if request.client else None,
             user_agent=request.headers.get("User-Agent"),
         )
-        await realtime_bus.emit_personal_event(
-            user_id=target_user_id,
-            payload={"action": "user_banned"},
-        )
+        try:
+            await realtime_bus.emit_personal_event(
+                user_id=target_user_id,
+                payload={"action": "user_deleted"},
+            )
+        except Exception:
+            logger.exception("realtime emit after delete_user failed (аккаунт уже удалён)")
         return {"message": "Аккаунт удален"}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.get("/admin/me/permissions", response_model=PermissionsResponse, summary="Мои permissions")
-async def admin_me_permissions(user_id: int = Depends(get_current_user)):
+async def admin_me_permissions(user_id: int = Depends(require_active_user)):
     permissions = sorted(list(await auth_service.get_effective_permissions(user_id)))
     return PermissionsResponse(permissions=permissions)
 
 
 @router.get("/admin/audit-logs", response_model=list[AdminAuditLogResponse], summary="Audit log админки")
-async def admin_audit_logs(user_id: int = Depends(get_current_user), limit: int = 100):
+async def admin_audit_logs(user_id: int = Depends(require_active_user), limit: int = 100):
     try:
         await auth_service.ensure_permission(user_id, Permission.VIEW_AUDIT_LOGS)
         data = await audit_log_service.list_admin_audit_logs(limit=limit)
@@ -709,7 +735,7 @@ async def admin_audit_logs(user_id: int = Depends(get_current_user), limit: int 
 
 
 @router.get("/admin/security-events", response_model=list[SecurityEventResponse], summary="Журнал безопасности")
-async def admin_security_events(user_id: int = Depends(get_current_user), limit: int = 100):
+async def admin_security_events(user_id: int = Depends(require_active_user), limit: int = 100):
     try:
         await auth_service.ensure_permission(user_id, Permission.VIEW_AUDIT_LOGS)
         data = await audit_log_service.list_security_events(limit=limit)

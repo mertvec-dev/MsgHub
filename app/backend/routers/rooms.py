@@ -18,7 +18,7 @@ from app.backend.services.rooms_service import room_service
 from app.backend.services.auth_service import auth_service
 
 # Получение user_id из JWT-токена
-from app.backend.utils.jwt_utils import get_current_user
+from app.backend.utils.jwt_utils import require_active_user
 
 # WebSocket менеджер — для уведомлений
 from app.backend.services.realtime_bus import realtime_bus
@@ -53,7 +53,7 @@ router = APIRouter(prefix="/rooms", tags=["rooms"])
     summary="Создать групповую комнату",
     description="Создаёт группу и добавляет создателя + приглашённых"
 )
-async def create_room(data: RoomCreate, user_id: int = Depends(get_current_user)):
+async def create_room(data: RoomCreate, user_id: int = Depends(require_active_user)):
     """
     Создаёт групповую комнату (тип всегда GROUP, даже если в data другой).
     Создатель автоматически становится участником со статусом OWNER.
@@ -96,7 +96,7 @@ async def create_room(data: RoomCreate, user_id: int = Depends(get_current_user)
     summary="Создать личный чат (direct)",
     description="Создаёт комнату типа 'direct' между двумя пользователями"
 )
-async def create_direct(target_user_id: int, user_id: int = Depends(get_current_user)):
+async def create_direct(target_user_id: int, user_id: int = Depends(require_active_user)):
     """
     Создаёт личный чат между текущим пользователем и target_user_id.
     Если direct-чат уже существует — сервис вернёт существующий.
@@ -153,7 +153,7 @@ async def create_direct(target_user_id: int, user_id: int = Depends(get_current_
     summary="Мои комнаты",
     description="Список всех комнат, где состоит текущий пользователь"
 )
-async def get_my_rooms(user_id: int = Depends(get_current_user)):
+async def get_my_rooms(user_id: int = Depends(require_active_user)):
     """Возвращает комнаты, где пользователь — участник (не забанен)."""
     return await room_service.get_user_rooms(user_id)
 
@@ -164,7 +164,7 @@ async def get_my_rooms(user_id: int = Depends(get_current_user)):
     summary="Участники комнаты",
     description="Список всех участников с их данными"
 )
-async def get_room_members(room_id: int, user_id: int = Depends(get_current_user)):
+async def get_room_members(room_id: int, user_id: int = Depends(require_active_user)):
     """
     Возвращает id, nickname, username всех участников комнаты.
     Нужно фронтенду, чтобы показать имя собеседника в direct-чате.
@@ -186,7 +186,7 @@ async def invite_user(
     request: Request,
     room_id: int,
     user_id: int,
-    actor_id: int = Depends(get_current_user)
+    actor_id: int = Depends(require_active_user)
 ):
     """
     actor_id — кто приглашает (из токена).
@@ -213,7 +213,7 @@ async def invite_user(
 async def kick_user(
     room_id: int,
     user_id: int,
-    actor_id: int = Depends(get_current_user)
+    actor_id: int = Depends(require_active_user)
 ):
     """
     actor_id — кто кикает.
@@ -236,7 +236,7 @@ async def kick_user(
     summary="Выйти из комнаты",
     description="Удаляет текущего пользователя из комнаты"
 )
-async def leave_room(room_id: int, user_id: int = Depends(get_current_user)):
+async def leave_room(room_id: int, user_id: int = Depends(require_active_user)):
     """Пользователь сам выходит из комнаты."""
     try:
         await room_service.exit_from_room(room_id, user_id)
@@ -258,7 +258,7 @@ async def ban_user(
     request: Request,
     room_id: int,
     user_id: int,
-    actor_id: int = Depends(get_current_user)
+    actor_id: int = Depends(require_active_user)
 ):
     """
     actor_id — кто банит.
@@ -285,7 +285,7 @@ async def ban_user(
     summary="Очистить историю сообщений",
     description="Удаляет все сообщения пользователя в данной комнате (только для себя)"
 )
-async def clear_history(room_id: int, user_id: int = Depends(get_current_user)):
+async def clear_history(room_id: int, user_id: int = Depends(require_active_user)):
     """
     Удаляет все сообщения, отправленные данным пользователем в этой комнате.
     Сообщения других участников НЕ удаляются.
@@ -310,7 +310,7 @@ async def mute_user(
     request: Request,
     payload: RoomMuteRequest,
     room_id: int,
-    actor_id: int = Depends(get_current_user),
+    actor_id: int = Depends(require_active_user),
 ):
     try:
         await room_service.mute_user(
@@ -344,7 +344,7 @@ async def unmute_user(
     request: Request,
     room_id: int,
     user_id: int,
-    actor_id: int = Depends(get_current_user),
+    actor_id: int = Depends(require_active_user),
 ):
     try:
         await room_service.unmute_user(room_id=room_id, user_id=user_id, actor_id=actor_id)
@@ -366,7 +366,7 @@ async def unmute_user(
     summary="Удалить комнату для себя",
     description="Скрывает комнату из списка текущего пользователя"
 )
-async def delete_room_self(request: Request, room_id: int, user_id: int = Depends(get_current_user)):
+async def delete_room_self(request: Request, room_id: int, user_id: int = Depends(require_active_user)):
     """
     Удаляет запись участника из room_members для текущего пользователя.
     Комната перестаёт появляться в списке «Мои комнаты».
@@ -400,7 +400,7 @@ async def delete_room_self(request: Request, room_id: int, user_id: int = Depend
 async def upsert_room_key(
     room_id: int,
     payload: RoomKeyEnvelopeUpsertRequest,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     """
     Загружает на сервер набор конвертов для room key.
@@ -425,7 +425,7 @@ async def upsert_room_key(
     summary="Получить мой актуальный конверт ключа",
     description="Возвращает encrypted room key для текущего пользователя и текущей версии комнаты",
 )
-async def get_my_room_key(room_id: int, user_id: int = Depends(get_current_user)):
+async def get_my_room_key(room_id: int, user_id: int = Depends(require_active_user)):
     """
     Возвращает только КОНВЕРТ текущего пользователя (my key envelope).
 
@@ -447,7 +447,7 @@ async def get_my_room_key(room_id: int, user_id: int = Depends(get_current_user)
     summary="Ротация версии room key",
     description="Повышает current_key_version комнаты на 1 (только admin/owner)",
 )
-async def rotate_room_key(room_id: int, user_id: int = Depends(get_current_user)):
+async def rotate_room_key(room_id: int, user_id: int = Depends(require_active_user)):
     """
     Ротация не меняет старые сообщения — она открывает НОВУЮ версию ключа.
     Дальше клиент должен загрузить новые конверты через /keys/upsert.

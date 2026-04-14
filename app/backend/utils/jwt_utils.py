@@ -136,3 +136,19 @@ def get_current_user(
             detail="Токен содержит некорректный user_id",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+async def require_active_user(user_id: int = Depends(get_current_user)) -> int:
+    """
+    Как get_current_user, но отсекает забаненных и деактивированных:
+    иначе старый JWT позволял бы слать сообщения до истечения access-токена.
+    """
+    from app.backend.services.auth_service import auth_service
+
+    user = await auth_service.get_me(user_id)
+    if user.is_banned or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Аккаунт заблокирован",
+        )
+    return user_id

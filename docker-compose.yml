@@ -56,15 +56,17 @@ services:
       - msghub_network
     restart: unless-stopped # Перезапуск контейнера при сбое
   
-  nginx: # Nginx
-    image: nginx:1.27-alpine
+  nginx: # Nginx + встроенная сборка фронта (см. Dockerfile.nginx)
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    image: msghub-nginx:latest
     container_name: msghub_nginx
     ports:
       - "80:80"
       # TODO: раскомментировать порт при отправке на ВМ: - "443:443"
     volumes:
       - ./nginx.conf/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./app/frontend/dist:/usr/share/nginx/html:ro # Статика фронтенда
       # - ./infrastructure/nginx/certs:/etc/nginx/certs:ro # Сертификаты
     depends_on:
       backend:

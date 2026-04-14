@@ -325,6 +325,10 @@ class AuthService:
         await self._require_permission(actor_user_id, Permission.MANAGE_USERS)
         return await self.admin_service.list_users()
 
+    async def search_users_admin(self, actor_user_id: int, query: str, limit: int = 50) -> list[User]:
+        await self._require_permission(actor_user_id, Permission.MANAGE_USERS)
+        return await self.admin_service.search_users(query, limit=limit)
+
     async def set_admin(self, actor_user_id: int, target_user_id: int, value: bool) -> User:
         await self._require_super_admin(actor_user_id)
         return await self.admin_service.set_admin_flag(target_user_id, value)

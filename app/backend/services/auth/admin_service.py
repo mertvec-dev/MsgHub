@@ -1,7 +1,7 @@
 """Admin-use-case слой для операций над пользователями."""
 
 from sqlmodel import select
-from sqlalchemy import func
+from sqlalchemy import func, or_, text
 
 from database.engine import db_engine
 from database.models.users import User, UserRole
@@ -21,6 +21,11 @@ from sqlalchemy import delete as sql_delete
 from app.backend.services.auth.rbac import effective_permissions
 
 
+def _escape_like_pattern(s: str) -> str:
+    """Экранирует %, _ и \\ для LIKE/ILIKE (иначе _ и % — спецсимволы SQL)."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class AdminService:
     """
     Сервис административных действий.
@@ -32,6 +37,42 @@ class AdminService:
         """Возвращает список всех пользователей в стабильной сортировке."""
         async for session in db_engine.get_async_session():
             res = await session.execute(select(User).order_by(User.id.asc()))
+            return list(res.scalars().all())
+
+    async def search_users(self, query: str, limit: int = 50) -> list[User]:
+        """Поиск по id, username, nickname, profile_tag (без полного скана списка в UI)."""
+        raw = (query or "").strip()
+        if not raw:
+            return []
+        if len(raw) > 96:
+            raw = raw[:96]
+        lim = max(1, min(int(limit), 100))
+        async for session in db_engine.get_async_session():
+            if raw.isdigit():
+                try:
+                    uid = int(raw)
+                except ValueError:
+                    return []
+                res = await session.execute(select(User).where(User.id == uid))
+                u = res.scalars().first()
+                return [u] if u else []
+            # @username в UI — ищем без префикса
+            needle = raw[1:] if raw.startswith("@") else raw
+            if not needle:
+                return []
+            like = f"%{_escape_like_pattern(needle)}%"
+            res = await session.execute(
+                select(User)
+                .where(
+                    or_(
+                        User.username.ilike(like, escape="\\"),
+                        User.nickname.ilike(like, escape="\\"),
+                        User.profile_tag.ilike(like, escape="\\"),
+                    )
+                )
+                .order_by(User.id.asc())
+                .limit(lim)
+            )
             return list(res.scalars().all())
 
     async def get_user_extra_permissions(self, user_id: int) -> set[str]:
@@ -151,6 +192,28 @@ class AdminService:
             if not user:
                 raise ValueError("Пользователь не найден")
 
+            # Иначе FK rooms.created_by -> users.id блокирует удаление пользователя
+            room_ids_res = await session.execute(select(Room.id).where(Room.created_by == target_user_id))
+            for rid in room_ids_res.scalars().all():
+                await session.execute(
+                    text(
+                        """
+                        DELETE FROM message_reads WHERE message_id IN (
+                            SELECT id FROM messages WHERE room_id = :rid
+                        )
+                        """
+                    ),
+                    {"rid": rid},
+                )
+                await session.execute(
+                    text("UPDATE messages SET reply_to_message_id = NULL WHERE room_id = :rid"),
+                    {"rid": rid},
+                )
+                await session.execute(text("DELETE FROM messages WHERE room_id = :rid"), {"rid": rid})
+                await session.execute(sql_delete(RoomKeyEnvelope).where(RoomKeyEnvelope.room_id == rid))
+                await session.execute(sql_delete(RoomMember).where(RoomMember.room_id == rid))
+                await session.execute(sql_delete(Room).where(Room.id == rid))
+
             await session.execute(sql_delete(MessageRead).where(MessageRead.user_id == target_user_id))
             await session.execute(sql_delete(RoomKeyEnvelope).where(RoomKeyEnvelope.user_id == target_user_id))
             await session.execute(sql_delete(UserPermission).where(UserPermission.user_id == target_user_id))
@@ -161,6 +224,10 @@ class AdminService:
                 sql_delete(Friendship).where(
                     (Friendship.sender_id == target_user_id) | (Friendship.receiver_id == target_user_id)
                 )
+            )
+            await session.execute(
+                text("UPDATE room_members SET muted_by_user_id = NULL WHERE muted_by_user_id = :uid"),
+                {"uid": target_user_id},
             )
             await session.execute(sql_delete(RoomMember).where(RoomMember.user_id == target_user_id))
             await session.execute(

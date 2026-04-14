@@ -20,7 +20,7 @@ from app.backend.schemas.messages import MessageCreate, MessageEditRequest, Mess
 from app.backend.services.notification_service import notification_service
 
 # Получение user_id из JWT-токена
-from app.backend.utils.jwt_utils import get_current_user
+from app.backend.utils.jwt_utils import require_active_user
 
 # WebSocket менеджер — для real-time отправки
 from app.backend.websocket import manager
@@ -64,7 +64,7 @@ async def _notify_messages_read(room_id: int, reader_id: int) -> None:
     description="Количество непрочитанных сообщений по каждой комнате"
 )
 @limiter.limit(settings.RATE_LIMIT_DEFAULT)
-async def get_unread_count(request: Request, user_id: int = Depends(get_current_user)):
+async def get_unread_count(request: Request, user_id: int = Depends(require_active_user)):
     """
     Возвращает словарь {room_id: count} и общую сумму.
     Фронтенд использует для отображения бейджей с количеством на каждой комнате.
@@ -79,7 +79,7 @@ async def get_unread_count(request: Request, user_id: int = Depends(get_current_
     description="Ручная пометка всех сообщений в комнате как прочитанных"
 )
 @limiter.limit(settings.RATE_LIMIT_DEFAULT)
-async def mark_as_read(request: Request, room_id: int, user_id: int = Depends(get_current_user)):
+async def mark_as_read(request: Request, room_id: int, user_id: int = Depends(require_active_user)):
     """
     Обновляет запись в message_reads, фиксируя время последнего прочтения.
     """
@@ -103,7 +103,7 @@ async def mark_as_read(request: Request, room_id: int, user_id: int = Depends(ge
 async def get_room_messages(
     room_id: int,
     request: Request,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
     limit: int = Query(
         default=50,
         le=100,
@@ -156,7 +156,7 @@ async def get_room_messages(
 async def send_message(
     request: Request,
     payload: MessageCreate,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     """
     Полный цикл отправки сообщения.
@@ -175,10 +175,13 @@ async def send_message(
 
         # Получаем никнейм отправителя для WebSocket (быстрый запрос)
         async for session in db_engine.get_async_session():
-            res = await session.execute(select(User.nickname, User.is_admin).where(User.id == user_id))
+            res = await session.execute(
+                select(User.nickname, User.is_admin, User.profile_tag).where(User.id == user_id)
+            )
             sender_row = res.first()
             sender_nickname = sender_row.nickname if sender_row else "Unknown"
             sender_is_admin = bool(sender_row.is_admin) if sender_row else False
+            sender_profile_tag = sender_row.profile_tag if sender_row else None
 
         # 2. Подготавливаем данные для рассылки
         message_data = {
@@ -188,6 +191,7 @@ async def send_message(
             "sender_id": user_id,
             "sender_nickname": sender_nickname,
             "sender_is_admin": sender_is_admin,
+            "sender_profile_tag": sender_profile_tag,
             "sender_device_id": msg.sender_device_id,
             "reply_to_message_id": msg.reply_to_message_id,
             "is_pinned": bool(getattr(msg, "is_pinned", False)),
@@ -233,7 +237,7 @@ async def edit_message(
     request: Request,
     message_id: int,
     payload: MessageEditRequest,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     """
     Полный цикл редактирования:
@@ -283,7 +287,7 @@ async def edit_message(
 async def delete_message(
     request: Request,
     message_id: int,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     """
     Удаляет сообщение (только автор).
@@ -315,7 +319,7 @@ async def pin_message(
     room_id: int,
     message_id: int,
     payload: MessagePinRequest,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     try:
         msg = await messages_service.pin_message(
@@ -346,7 +350,7 @@ async def unpin_message(
     request: Request,
     room_id: int,
     message_id: int,
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(require_active_user),
 ):
     try:
         msg = await messages_service.unpin_message(

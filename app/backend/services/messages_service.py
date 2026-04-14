@@ -268,6 +268,7 @@ class MessageService:
                     Message,
                     User.nickname.label("sender_nickname"),
                     User.is_admin.label("sender_is_admin"),
+                    User.profile_tag.label("sender_profile_tag"),
                 )
                 .join(User, Message.sender_id == User.id)
                 .where(Message.room_id == room_id)
@@ -287,8 +288,8 @@ class MessageService:
             messages: List[Dict[str, Any]] = []
             # Убираем N+1: читаем message_reads одной пачкой для всей страницы.
             ordered_rows = list(reversed(rows))
-            message_ids = [msg.id for msg, _, _ in ordered_rows]
-            sender_by_message_id = {msg.id: int(msg.sender_id) for msg, _, _ in ordered_rows}
+            message_ids = [msg.id for msg, _, _, _ in ordered_rows]
+            sender_by_message_id = {msg.id: int(msg.sender_id) for msg, _, _, _ in ordered_rows}
             sender_seen_by_other: set[int] = set()
             viewer_seen: set[int] = set()
             if message_ids:
@@ -306,7 +307,7 @@ class MessageService:
                     if int(reader_id) == int(user_id):
                         viewer_seen.add(int(message_id))
 
-            for msg, nickname, sender_is_admin in ordered_rows:
+            for msg, nickname, sender_is_admin, sender_profile_tag in ordered_rows:
                 if int(msg.sender_id) == int(user_id):
                     is_read = int(msg.id) in sender_seen_by_other
                 else:
@@ -319,6 +320,7 @@ class MessageService:
                     "sender_device_id": msg.sender_device_id,
                     "sender_nickname": nickname,
                     "sender_is_admin": bool(sender_is_admin),
+                    "sender_profile_tag": sender_profile_tag,
                     "content": msg.content,  # ciphertext
                     "nonce": msg.nonce,
                     "key_version": msg.key_version,
