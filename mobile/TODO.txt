@@ -1,2 +1,4 @@
 TODO: СДЕЛАТЬ МОБИЛКУ НА React-Native.
 TODO: СДЕЛАТЬ ПРИЛОЖЕНИЕ НА Electron.
+
+Хуй
